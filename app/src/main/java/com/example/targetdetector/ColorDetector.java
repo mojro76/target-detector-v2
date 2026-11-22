@@ -70,8 +70,9 @@ public class ColorDetector {
         float scaleX = (float) outputWidth / width;
         float scaleY = (float) outputHeight / height;
 
-        int step = 6;
-        float mergeDistance = 45f;
+        // step = 3 passt exakt zur halben Aufnahme-Auflösung aus ScreenCaptureService
+        int step = 3;
+        float mergeDistance = 40f;
         int minHitsRequired = 4;
 
         List<Cluster> clusters = new ArrayList<>();
@@ -113,16 +114,16 @@ public class ColorDetector {
                 continue;
             }
 
-            float padding = 12f;
+            float padding = 10f;
             float left = Math.max(0, c.minX - padding);
             float top = Math.max(0, c.minY - padding);
             float right = Math.min(outputWidth, c.maxX + padding);
             float bottom = Math.min(outputHeight, c.maxY + padding);
 
-            // Riesige Hintergrundflächen (> 35% der Bildschirmbreite/-höhe) ignorieren
+            // Große Flächen / Videos (> 20% der Bildschirmbreite oder -höhe) ignorieren
             float boxWidth = right - left;
             float boxHeight = bottom - top;
-            if (boxWidth > outputWidth * 0.35f || boxHeight > outputHeight * 0.35f) {
+            if (boxWidth > outputWidth * 0.20f || boxHeight > outputHeight * 0.20f) {
                 continue;
             }
 
