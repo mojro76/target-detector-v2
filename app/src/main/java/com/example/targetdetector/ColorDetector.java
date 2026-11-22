@@ -49,7 +49,7 @@ public class ColorDetector {
 
         boolean isNear(float x, float y, float mergeDistance) {
             return x >= (minX - mergeDistance) && x <= (maxX + mergeDistance)
-                && y >= (minY - mergeDistance) && y <= (maxY + mergeDistance);
+                    && y >= (minY - mergeDistance) && y <= (maxY + mergeDistance);
         }
     }
 
@@ -64,7 +64,6 @@ public class ColorDetector {
         int width = bitmap.getWidth();
         int height = bitmap.getHeight();
 
-        // Alle Pixel auf einmal in den Speicher laden (deutlich schneller)
         int[] pixels = new int[width * height];
         bitmap.getPixels(pixels, 0, width, 0, 0, width, height);
 
@@ -72,9 +71,7 @@ public class ColorDetector {
         float scaleY = (float) outputHeight / height;
 
         int step = 6;
-        // Maximale Distanz in Pixeln, bis zu der Treffer zu einem Ziel verschmolzen werden
         float mergeDistance = 45f;
-        // Mindestanzahl an Trefferpunkten, damit Einzelpixel-Rauschen ignoriert wird
         int minHitsRequired = 4;
 
         List<Cluster> clusters = new ArrayList<>();
@@ -109,7 +106,6 @@ public class ColorDetector {
             }
         }
 
-        // Zusammengehörige Cluster nochmals verschmelzen, falls zwei Teile zusammengewachsen sind
         mergeOverlappingClusters(clusters, mergeDistance * 0.5f);
 
         for (Cluster c : clusters) {
@@ -122,6 +118,13 @@ public class ColorDetector {
             float top = Math.max(0, c.minY - padding);
             float right = Math.min(outputWidth, c.maxX + padding);
             float bottom = Math.min(outputHeight, c.maxY + padding);
+
+            // Riesige Hintergrundflächen (> 35% der Bildschirmbreite/-höhe) ignorieren
+            float boxWidth = right - left;
+            float boxHeight = bottom - top;
+            if (boxWidth > outputWidth * 0.35f || boxHeight > outputHeight * 0.35f) {
+                continue;
+            }
 
             detections.add(new Detection(new RectF(left, top, right, bottom), c.type));
         }
@@ -165,22 +168,18 @@ public class ColorDetector {
         float saturation = hsv[1];
         float value = hsv[2];
 
-        // Hohe Sättigung und Helligkeit verlangen, um Hauttöne & matte Hintergründe zu filtern
         if (saturation < 0.65f || value < 0.45f) {
             return null;
         }
 
-        // Kräftiges Grün (PLAYER)
         if (hue >= 85 && hue <= 155) {
             return TargetType.PLAYER;
         }
 
-        // Kräftiges Cyan/Blau (TEAMMATE)
         if (hue >= 190 && hue <= 245) {
             return TargetType.TEAMMATE;
         }
 
-        // Reines, kräftiges Rot ohne Hauttöne (ENEMY)
         if (hue <= 12 || hue >= 348) {
             return TargetType.ENEMY;
         }
