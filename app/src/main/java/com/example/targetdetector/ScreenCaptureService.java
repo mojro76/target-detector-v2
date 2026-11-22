@@ -5,6 +5,7 @@ import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.Service;
 import android.content.Intent;
+import android.content.pm.ServiceInfo;
 import android.graphics.Bitmap;
 import android.graphics.PixelFormat;
 import android.hardware.display.DisplayManager;
@@ -17,6 +18,8 @@ import android.os.Build;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.IBinder;
+import android.os.Looper;
+import android.provider.Settings;
 import android.util.DisplayMetrics;
 import android.view.WindowManager;
 
@@ -25,6 +28,7 @@ public class ScreenCaptureService extends Service {
     private static final String CHANNEL_ID = "target_detector_channel";
 
     private MediaProjection mediaProjection;
+    private MediaProjection.Callback projectionCallback;
     private VirtualDisplay virtualDisplay;
     private ImageReader imageReader;
     private HandlerThread handlerThread;
@@ -40,7 +44,22 @@ public class ScreenCaptureService extends Service {
         super.onCreate();
 
         createNotificationChannel();
-        startForeground(10, createNotification());
+
+        Notification notification = createNotification();
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(
+                    10,
+                    notification,
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+            );
+        } else {
+            startForeground(10, notification);
+        }
+
+        if (!Settings.canDrawOverlays(this)) {
+            stopSelf();
+            return;
+        }
 
         DisplayMetrics metrics = getResources().getDisplayMetrics();
         screenWidth = metrics.widthPixels;
@@ -69,14 +88,36 @@ public class ScreenCaptureService extends Service {
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
+        if (intent == null || overlayView == null || mediaProjection != null) {
+            return START_NOT_STICKY;
+        }
+
         int resultCode = intent.getIntExtra("resultCode", 0);
-        Intent resultData = intent.getParcelableExtra("resultData");
+
+        Intent resultData;
+        if (Build.VERSION.SDK_INT >= 33) {
+            resultData = intent.getParcelableExtra("resultData", Intent.class);
+        } else {
+            resultData = intent.getParcelableExtra("resultData");
+        }
 
         if (resultData != null) {
             MediaProjectionManager manager =
                     (MediaProjectionManager) getSystemService(MEDIA_PROJECTION_SERVICE);
 
             mediaProjection = manager.getMediaProjection(resultCode, resultData);
+
+            projectionCallback = new MediaProjection.Callback() {
+                @Override
+                public void onStop() {
+                    stopSelf();
+                }
+            };
+            mediaProjection.registerCallback(
+                    projectionCallback,
+                    new Handler(Looper.getMainLooper())
+            );
+
             startCapture();
         }
 
@@ -135,21 +176,27 @@ public class ScreenCaptureService extends Service {
         int rowStride = plane.getRowStride();
         int rowPadding = rowStride - pixelStride * screenWidth;
 
-        Bitmap bitmap = Bitmap.createBitmap(
+        Bitmap fullBitmap = Bitmap.createBitmap(
                 screenWidth + rowPadding / pixelStride,
                 screenHeight,
                 Bitmap.Config.ARGB_8888
         );
 
-        bitmap.copyPixelsFromBuffer(plane.getBuffer());
+        fullBitmap.copyPixelsFromBuffer(plane.getBuffer());
 
-        return Bitmap.createBitmap(
-                bitmap,
+        Bitmap cropped = Bitmap.createBitmap(
+                fullBitmap,
                 0,
                 0,
                 screenWidth,
                 screenHeight
         );
+
+        if (cropped != fullBitmap) {
+            fullBitmap.recycle();
+        }
+
+        return cropped;
     }
 
     private Notification createNotification() {
@@ -186,11 +233,17 @@ public class ScreenCaptureService extends Service {
         }
 
         if (mediaProjection != null) {
+            if (projectionCallback != null) {
+                mediaProjection.unregisterCallback(projectionCallback);
+            }
             mediaProjection.stop();
         }
 
         if (overlayView != null && windowManager != null) {
-            windowManager.removeView(overlayView);
+            try {
+                windowManager.removeView(overlayView);
+            } catch (IllegalArgumentException ignored) {
+            }
         }
 
         if (handlerThread != null) {
