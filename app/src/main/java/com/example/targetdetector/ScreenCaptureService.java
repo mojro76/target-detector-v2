@@ -27,6 +27,7 @@ import java.util.List;
 public class ScreenCaptureService extends Service {
 
     private static final String CHANNEL_ID = "target_detector_channel";
+    private static final long MIN_FRAME_INTERVAL_MS = 66; // ca. 15 FPS
 
     private MediaProjection mediaProjection;
     private MediaProjection.Callback projectionCallback;
@@ -40,8 +41,11 @@ public class ScreenCaptureService extends Service {
 
     private int screenWidth;
     private int screenHeight;
+    private int captureWidth;
+    private int captureHeight;
     private int screenDensity;
     private boolean isResizing = false;
+    private long lastProcessTime = 0;
 
     @Override
     public void onCreate() {
@@ -56,6 +60,8 @@ public class ScreenCaptureService extends Service {
         windowManager.getDefaultDisplay().getRealMetrics(metrics);
         screenWidth = metrics.widthPixels;
         screenHeight = metrics.heightPixels;
+        captureWidth = Math.max(1, screenWidth / 2);
+        captureHeight = Math.max(1, screenHeight / 2);
         screenDensity = metrics.densityDpi;
     }
 
@@ -76,7 +82,6 @@ public class ScreenCaptureService extends Service {
                 PixelFormat.TRANSLUCENT
         );
 
-        // Fix gegen Versatz nach unten durch Statusleiste / Frontkamera
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
             params.layoutInDisplayCutoutMode =
                     WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
@@ -164,8 +169,8 @@ public class ScreenCaptureService extends Service {
 
         ImageReader oldReader = imageReader;
         ImageReader newReader = ImageReader.newInstance(
-                screenWidth,
-                screenHeight,
+                captureWidth,
+                captureHeight,
                 PixelFormat.RGBA_8888,
                 2
         );
@@ -187,14 +192,20 @@ public class ScreenCaptureService extends Service {
             Image image = null;
             try {
                 image = reader.acquireLatestImage();
-                if (image != null) {
-                    Bitmap bitmap = imageToBitmap(image);
-                    if (bitmap != null) {
-                        List<ColorDetector.Detection> detections =
-                                ColorDetector.detect(bitmap, screenWidth, screenHeight);
-                        overlayView.updateDetections(detections);
-                        bitmap.recycle();
-                    }
+                if (image == null) return;
+
+                long now = System.currentTimeMillis();
+                if (now - lastProcessTime < MIN_FRAME_INTERVAL_MS) {
+                    return;
+                }
+                lastProcessTime = now;
+
+                Bitmap bitmap = imageToBitmap(image);
+                if (bitmap != null) {
+                    List<ColorDetector.Detection> detections =
+                            ColorDetector.detect(bitmap, screenWidth, screenHeight);
+                    overlayView.updateDetections(detections);
+                    bitmap.recycle();
                 }
             } catch (Exception ignored) {
             } finally {
@@ -209,16 +220,16 @@ public class ScreenCaptureService extends Service {
         if (virtualDisplay == null) {
             virtualDisplay = mediaProjection.createVirtualDisplay(
                     "TargetDetectorDisplay",
-                    screenWidth,
-                    screenHeight,
-                    screenDensity,
+                    captureWidth,
+                    captureHeight,
+                    screenDensity / 2,
                     DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
                     imageReader.getSurface(),
                     null,
                     handler
             );
         } else {
-            virtualDisplay.resize(screenWidth, screenHeight, screenDensity);
+            virtualDisplay.resize(captureWidth, captureHeight, screenDensity / 2);
             virtualDisplay.setSurface(imageReader.getSurface());
         }
 
@@ -232,15 +243,15 @@ public class ScreenCaptureService extends Service {
         ByteBuffer buffer = planes[0].getBuffer();
         int pixelStride = planes[0].getPixelStride();
         int rowStride = planes[0].getRowStride();
-        int rowPadding = rowStride - pixelStride * screenWidth;
+        int rowPadding = rowStride - pixelStride * captureWidth;
 
         Bitmap bitmap = Bitmap.createBitmap(
-                screenWidth + rowPadding / pixelStride,
-                screenHeight,
+                captureWidth + rowPadding / pixelStride,
+                captureHeight,
                 Bitmap.Config.ARGB_8888
         );
         bitmap.copyPixelsFromBuffer(buffer);
-        Bitmap cropped = Bitmap.createBitmap(bitmap, 0, 0, screenWidth, screenHeight);
+        Bitmap cropped = Bitmap.createBitmap(bitmap, 0, 0, captureWidth, captureHeight);
         bitmap.recycle();
         return cropped;
     }
