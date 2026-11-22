@@ -18,10 +18,8 @@ public class OverlayView extends View {
     public OverlayView(Context context) {
         super(context);
 
-        setLayerType(View.LAYER_TYPE_SOFTWARE, null);
-
         paint.setStyle(Paint.Style.STROKE);
-        paint.setStrokeWidth(5f);
+        paint.setStrokeWidth(6f);
     }
 
     public void updateDetections(List<ColorDetector.Detection> newDetections) {
@@ -34,6 +32,10 @@ public class OverlayView extends View {
     @Override
     protected void onDraw(Canvas canvas) {
         super.onDraw(canvas);
+
+        if (detections.isEmpty()) {
+            return;
+        }
 
         for (ColorDetector.Detection detection : detections) {
             if (detection.type == ColorDetector.TargetType.PLAYER) {
