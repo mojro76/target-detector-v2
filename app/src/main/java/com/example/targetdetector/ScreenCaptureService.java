@@ -5,6 +5,7 @@ import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.Service;
 import android.content.Intent;
+import android.content.pm.ServiceInfo;
 import android.graphics.Bitmap;
 import android.graphics.PixelFormat;
 import android.hardware.display.DisplayManager;
@@ -39,6 +40,7 @@ public class ScreenCaptureService extends Service {
     private int screenWidth;
     private int screenHeight;
     private int screenDensity;
+    private boolean isResizing = false;
 
     @Override
     public void onCreate() {
@@ -79,7 +81,16 @@ public class ScreenCaptureService extends Service {
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
         createNotificationChannel();
-        startForeground(1, createNotification());
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(
+                    1,
+                    createNotification(),
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+            );
+        } else {
+            startForeground(1, createNotification());
+        }
 
         if (intent == null) return START_NOT_STICKY;
 
@@ -91,9 +102,11 @@ public class ScreenCaptureService extends Service {
             return START_NOT_STICKY;
         }
 
-        handlerThread = new HandlerThread("ScreenCaptureThread");
-        handlerThread.start();
-        handler = new Handler(handlerThread.getLooper());
+        if (handlerThread == null) {
+            handlerThread = new HandlerThread("ScreenCaptureThread");
+            handlerThread.start();
+            handler = new Handler(handlerThread.getLooper());
+        }
 
         MediaProjectionManager projectionManager =
                 (MediaProjectionManager) getSystemService(MEDIA_PROJECTION_SERVICE);
@@ -107,37 +120,35 @@ public class ScreenCaptureService extends Service {
                 }
             }, handler);
 
-            createCaptureSession();
+            setupCapture();
         }
 
         return START_NOT_STICKY;
     }
 
-    private void createCaptureSession() {
-        if (virtualDisplay != null) {
-            virtualDisplay.release();
-            virtualDisplay = null;
-        }
-        if (imageReader != null) {
-            imageReader.close();
-            imageReader = null;
-        }
-
+    private void setupCapture() {
         updateScreenMetrics();
 
-        imageReader = ImageReader.newInstance(
+        ImageReader oldReader = imageReader;
+        ImageReader newReader = ImageReader.newInstance(
                 screenWidth,
                 screenHeight,
                 PixelFormat.RGBA_8888,
                 2
         );
 
-        imageReader.setOnImageAvailableListener(reader -> {
+        newReader.setOnImageAvailableListener(reader -> {
+            if (isResizing) return;
+
             // Prüfen, ob das Handy gedreht wurde (Hoch- <-> Querformat)
             DisplayMetrics currentMetrics = new DisplayMetrics();
             windowManager.getDefaultDisplay().getRealMetrics(currentMetrics);
             if (currentMetrics.widthPixels != screenWidth || currentMetrics.heightPixels != screenHeight) {
-                handler.post(this::createCaptureSession);
+                isResizing = true;
+                handler.post(() -> {
+                    setupCapture();
+                    isResizing = false;
+                });
                 return;
             }
 
@@ -161,16 +172,29 @@ public class ScreenCaptureService extends Service {
             }
         }, handler);
 
-        virtualDisplay = mediaProjection.createVirtualDisplay(
-                "TargetDetectorDisplay",
-                screenWidth,
-                screenHeight,
-                screenDensity,
-                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-                imageReader.getSurface(),
-                null,
-                handler
-        );
+        imageReader = newReader;
+
+        if (virtualDisplay == null) {
+            // VirtualDisplay wird nur EINMAL erstellt (Android 14/15 Pflicht)
+            virtualDisplay = mediaProjection.createVirtualDisplay(
+                    "TargetDetectorDisplay",
+                    screenWidth,
+                    screenHeight,
+                    screenDensity,
+                    DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                    imageReader.getSurface(),
+                    null,
+                    handler
+            );
+        } else {
+            // Bei Drehung nur Größe und Surface aktualisieren statt neu zu erstellen
+            virtualDisplay.resize(screenWidth, screenHeight, screenDensity);
+            virtualDisplay.setSurface(imageReader.getSurface());
+        }
+
+        if (oldReader != null) {
+            oldReader.close();
+        }
     }
 
     private Bitmap imageToBitmap(Image image) {
@@ -215,13 +239,26 @@ public class ScreenCaptureService extends Service {
 
     @Override
     public void onDestroy() {
-        if (virtualDisplay != null) virtualDisplay.release();
-        if (imageReader != null) imageReader.close();
-        if (mediaProjection != null) mediaProjection.stop();
+        if (virtualDisplay != null) {
+            virtualDisplay.release();
+            virtualDisplay = null;
+        }
+        if (imageReader != null) {
+            imageReader.close();
+            imageReader = null;
+        }
+        if (mediaProjection != null) {
+            mediaProjection.stop();
+            mediaProjection = null;
+        }
         if (overlayView != null && windowManager != null) {
             windowManager.removeView(overlayView);
+            overlayView = null;
         }
-        if (handlerThread != null) handlerThread.quitSafely();
+        if (handlerThread != null) {
+            handlerThread.quitSafely();
+            handlerThread = null;
+        }
         super.onDestroy();
     }
 
