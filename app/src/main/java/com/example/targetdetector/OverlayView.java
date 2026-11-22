@@ -12,6 +12,11 @@ import java.util.List;
 
 public class OverlayView extends View {
 
+    // Sättigung ~39% -> klar sichtbar als Grün/Blau/Rot, aber sicher unter der 65%-Schwelle vom ColorDetector
+    private static final int COLOR_PLAYER = Color.rgb(155, 255, 155);
+    private static final int COLOR_TEAMMATE = Color.rgb(155, 190, 255);
+    private static final int COLOR_ENEMY = Color.rgb(255, 155, 155);
+
     private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private List<ColorDetector.Detection> detections = new ArrayList<>();
 
@@ -39,11 +44,11 @@ public class OverlayView extends View {
 
         for (ColorDetector.Detection detection : detections) {
             if (detection.type == ColorDetector.TargetType.PLAYER) {
-                paint.setColor(Color.GREEN);
+                paint.setColor(COLOR_PLAYER);
             } else if (detection.type == ColorDetector.TargetType.TEAMMATE) {
-                paint.setColor(Color.BLUE);
+                paint.setColor(COLOR_TEAMMATE);
             } else {
-                paint.setColor(Color.RED);
+                paint.setColor(COLOR_ENEMY);
             }
 
             RectF box = detection.box;
