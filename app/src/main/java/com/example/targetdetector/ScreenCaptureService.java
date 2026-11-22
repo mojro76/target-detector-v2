@@ -5,7 +5,6 @@ import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.Service;
 import android.content.Intent;
-import android.content.pm.ServiceInfo;
 import android.graphics.Bitmap;
 import android.graphics.PixelFormat;
 import android.hardware.display.DisplayManager;
@@ -18,22 +17,24 @@ import android.os.Build;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.IBinder;
-import android.os.Looper;
-import android.provider.Settings;
 import android.util.DisplayMetrics;
 import android.view.WindowManager;
+
+import java.nio.ByteBuffer;
+import java.util.List;
 
 public class ScreenCaptureService extends Service {
 
     private static final String CHANNEL_ID = "target_detector_channel";
 
     private MediaProjection mediaProjection;
-    private MediaProjection.Callback projectionCallback;
     private VirtualDisplay virtualDisplay;
     private ImageReader imageReader;
     private HandlerThread handlerThread;
-    private OverlayView overlayView;
+    private Handler handler;
+
     private WindowManager windowManager;
+    private OverlayView overlayView;
 
     private int screenWidth;
     private int screenHeight;
@@ -42,93 +43,87 @@ public class ScreenCaptureService extends Service {
     @Override
     public void onCreate() {
         super.onCreate();
+        windowManager = (WindowManager) getSystemService(WINDOW_SERVICE);
+        updateScreenMetrics();
+        setupOverlay();
+    }
 
-        createNotificationChannel();
-
-        Notification notification = createNotification();
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(
-                    10,
-                    notification,
-                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
-            );
-        } else {
-            startForeground(10, notification);
-        }
-
-        if (!Settings.canDrawOverlays(this)) {
-            stopSelf();
-            return;
-        }
-
-        DisplayMetrics metrics = getResources().getDisplayMetrics();
+    private void updateScreenMetrics() {
+        DisplayMetrics metrics = new DisplayMetrics();
+        windowManager.getDefaultDisplay().getRealMetrics(metrics);
         screenWidth = metrics.widthPixels;
         screenHeight = metrics.heightPixels;
         screenDensity = metrics.densityDpi;
+    }
 
-        windowManager = (WindowManager) getSystemService(WINDOW_SERVICE);
-
+    private void setupOverlay() {
         overlayView = new OverlayView(this);
+        int overlayType = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
+                ? WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+                : WindowManager.LayoutParams.TYPE_PHONE;
 
-        WindowManager.LayoutParams overlayParams =
-                new WindowManager.LayoutParams(
-                        screenWidth,
-                        screenHeight,
-                        Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
-                                ? WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
-                                : WindowManager.LayoutParams.TYPE_PHONE,
-                        WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
-                                | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
-                                | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
-                        PixelFormat.TRANSLUCENT
-                );
+        WindowManager.LayoutParams params = new WindowManager.LayoutParams(
+                WindowManager.LayoutParams.MATCH_PARENT,
+                WindowManager.LayoutParams.MATCH_PARENT,
+                overlayType,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                        | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                        | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+                        | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                PixelFormat.TRANSLUCENT
+        );
 
-        windowManager.addView(overlayView, overlayParams);
+        windowManager.addView(overlayView, params);
     }
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
-        if (intent == null || overlayView == null || mediaProjection != null) {
+        createNotificationChannel();
+        startForeground(1, createNotification());
+
+        if (intent == null) return START_NOT_STICKY;
+
+        int resultCode = intent.getIntExtra("resultCode", -1);
+        Intent data = intent.getParcelableExtra("resultData");
+
+        if (data == null) {
+            stopSelf();
             return START_NOT_STICKY;
         }
 
-        int resultCode = intent.getIntExtra("resultCode", 0);
+        handlerThread = new HandlerThread("ScreenCaptureThread");
+        handlerThread.start();
+        handler = new Handler(handlerThread.getLooper());
 
-        Intent resultData;
-        if (Build.VERSION.SDK_INT >= 33) {
-            resultData = intent.getParcelableExtra("resultData", Intent.class);
-        } else {
-            resultData = intent.getParcelableExtra("resultData");
-        }
+        MediaProjectionManager projectionManager =
+                (MediaProjectionManager) getSystemService(MEDIA_PROJECTION_SERVICE);
+        mediaProjection = projectionManager.getMediaProjection(resultCode, data);
 
-        if (resultData != null) {
-            MediaProjectionManager manager =
-                    (MediaProjectionManager) getSystemService(MEDIA_PROJECTION_SERVICE);
-
-            mediaProjection = manager.getMediaProjection(resultCode, resultData);
-
-            projectionCallback = new MediaProjection.Callback() {
+        if (mediaProjection != null) {
+            mediaProjection.registerCallback(new MediaProjection.Callback() {
                 @Override
                 public void onStop() {
                     stopSelf();
                 }
-            };
-            mediaProjection.registerCallback(
-                    projectionCallback,
-                    new Handler(Looper.getMainLooper())
-            );
+            }, handler);
 
-            startCapture();
+            createCaptureSession();
         }
 
         return START_NOT_STICKY;
     }
 
-    private void startCapture() {
-        handlerThread = new HandlerThread("ScreenCaptureThread");
-        handlerThread.start();
+    private void createCaptureSession() {
+        if (virtualDisplay != null) {
+            virtualDisplay.release();
+            virtualDisplay = null;
+        }
+        if (imageReader != null) {
+            imageReader.close();
+            imageReader = null;
+        }
 
-        Handler handler = new Handler(handlerThread.getLooper());
+        updateScreenMetrics();
 
         imageReader = ImageReader.newInstance(
                 screenWidth,
@@ -138,22 +133,31 @@ public class ScreenCaptureService extends Service {
         );
 
         imageReader.setOnImageAvailableListener(reader -> {
-            Image image = reader.acquireLatestImage();
-
-            if (image == null) {
+            // Prüfen, ob das Handy gedreht wurde (Hoch- <-> Querformat)
+            DisplayMetrics currentMetrics = new DisplayMetrics();
+            windowManager.getDefaultDisplay().getRealMetrics(currentMetrics);
+            if (currentMetrics.widthPixels != screenWidth || currentMetrics.heightPixels != screenHeight) {
+                handler.post(this::createCaptureSession);
                 return;
             }
 
+            Image image = null;
             try {
-                Bitmap bitmap = imageToBitmap(image);
-                if (bitmap != null) {
-                    overlayView.updateDetections(
-                            ColorDetector.detect(bitmap, screenWidth, screenHeight)
-                    );
-                    bitmap.recycle();
+                image = reader.acquireLatestImage();
+                if (image != null) {
+                    Bitmap bitmap = imageToBitmap(image);
+                    if (bitmap != null) {
+                        List<ColorDetector.Detection> detections =
+                                ColorDetector.detect(bitmap, screenWidth, screenHeight);
+                        overlayView.updateDetections(detections);
+                        bitmap.recycle();
+                    }
                 }
+            } catch (Exception ignored) {
             } finally {
-                image.close();
+                if (image != null) {
+                    image.close();
+                }
             }
         }, handler);
 
@@ -170,32 +174,20 @@ public class ScreenCaptureService extends Service {
     }
 
     private Bitmap imageToBitmap(Image image) {
-        Image.Plane plane = image.getPlanes()[0];
-
-        int pixelStride = plane.getPixelStride();
-        int rowStride = plane.getRowStride();
+        Image.Plane[] planes = image.getPlanes();
+        ByteBuffer buffer = planes[0].getBuffer();
+        int pixelStride = planes[0].getPixelStride();
+        int rowStride = planes[0].getRowStride();
         int rowPadding = rowStride - pixelStride * screenWidth;
 
-        Bitmap fullBitmap = Bitmap.createBitmap(
+        Bitmap bitmap = Bitmap.createBitmap(
                 screenWidth + rowPadding / pixelStride,
                 screenHeight,
                 Bitmap.Config.ARGB_8888
         );
-
-        fullBitmap.copyPixelsFromBuffer(plane.getBuffer());
-
-        Bitmap cropped = Bitmap.createBitmap(
-                fullBitmap,
-                0,
-                0,
-                screenWidth,
-                screenHeight
-        );
-
-        if (cropped != fullBitmap) {
-            fullBitmap.recycle();
-        }
-
+        bitmap.copyPixelsFromBuffer(buffer);
+        Bitmap cropped = Bitmap.createBitmap(bitmap, 0, 0, screenWidth, screenHeight);
+        bitmap.recycle();
         return cropped;
     }
 
@@ -214,42 +206,22 @@ public class ScreenCaptureService extends Service {
                     "Target Detector",
                     NotificationManager.IMPORTANCE_LOW
             );
-
-            NotificationManager manager =
-                    getSystemService(NotificationManager.class);
-
-            manager.createNotificationChannel(channel);
+            NotificationManager manager = getSystemService(NotificationManager.class);
+            if (manager != null) {
+                manager.createNotificationChannel(channel);
+            }
         }
     }
 
     @Override
     public void onDestroy() {
-        if (virtualDisplay != null) {
-            virtualDisplay.release();
-        }
-
-        if (imageReader != null) {
-            imageReader.close();
-        }
-
-        if (mediaProjection != null) {
-            if (projectionCallback != null) {
-                mediaProjection.unregisterCallback(projectionCallback);
-            }
-            mediaProjection.stop();
-        }
-
+        if (virtualDisplay != null) virtualDisplay.release();
+        if (imageReader != null) imageReader.close();
+        if (mediaProjection != null) mediaProjection.stop();
         if (overlayView != null && windowManager != null) {
-            try {
-                windowManager.removeView(overlayView);
-            } catch (IllegalArgumentException ignored) {
-            }
+            windowManager.removeView(overlayView);
         }
-
-        if (handlerThread != null) {
-            handlerThread.quitSafely();
-        }
-
+        if (handlerThread != null) handlerThread.quitSafely();
         super.onDestroy();
     }
 
