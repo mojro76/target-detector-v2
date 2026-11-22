@@ -76,6 +76,12 @@ public class ScreenCaptureService extends Service {
                 PixelFormat.TRANSLUCENT
         );
 
+        // Fix gegen Versatz nach unten durch Statusleiste / Frontkamera
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            params.layoutInDisplayCutoutMode =
+                    WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
+        }
+
         windowManager.addView(overlayView, params);
     }
 
@@ -103,7 +109,6 @@ public class ScreenCaptureService extends Service {
             return START_NOT_STICKY;
         }
 
-        // Alte Sitzung sauber beenden, bevor die neue startet
         cleanupCapture();
 
         if (handlerThread == null) {
