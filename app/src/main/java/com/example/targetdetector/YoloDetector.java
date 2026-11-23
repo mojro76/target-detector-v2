@@ -58,6 +58,8 @@ public class YoloDetector {
     private int padY = 0;
     private int[] sxMap = new int[0];
     private int[] syMap = new int[0];
+    private byte[] rowBytes = new byte[0];
+    private float[] rowFloats = new float[0];
 
     // 0 = unbekannt, 1 = normalisiert (0..1), 2 = Pixel
     private int coordMode = 0;
@@ -244,31 +246,54 @@ public class YoloDetector {
         int bufferLimit = buffer.limit();
         int planeSize = inputWidth * inputHeight;
 
-        // Nur den Bildbereich schreiben, der graue Rand bleibt unverändert
+        // Nur den Bildbereich schreiben, der graue Rand bleibt unverändert.
+        // Jede Quellzeile wird auf einmal in ein Array kopiert (viel schneller als Pixel für Pixel).
+        if (rowBytes.length < rowStride) {
+            rowBytes = new byte[rowStride];
+        }
+        if (rowFloats.length < scaledW * 3) {
+            rowFloats = new float[scaledW * 3];
+        }
+        int neededBytes = sxMap[scaledW - 1] * pixelStride + 4;
+
         for (int y = 0; y < scaledH; y++) {
-            int iy = padY + y;
-            int rowOffset = syMap[y] * rowStride;
-            int rowIndex = iy * inputWidth + padX;
+            int rowStart = syMap[y] * rowStride;
+            if (rowStart < 0 || rowStart >= bufferLimit) {
+                continue;
+            }
+            int len = Math.min(Math.min(rowStride, neededBytes), bufferLimit - rowStart);
+            buffer.position(rowStart);
+            buffer.get(rowBytes, 0, len);
 
-            for (int x = 0; x < scaledW; x++) {
-                int offset = rowOffset + sxMap[x] * pixelStride;
-                if (offset < 0 || offset + 2 >= bufferLimit) {
-                    continue;
+            int rowIndex = (padY + y) * inputWidth + padX;
+
+            if (!isInputNchw) {
+                int o = 0;
+                for (int x = 0; x < scaledW; x++) {
+                    int off = sxMap[x] * pixelStride;
+                    if (off + 2 < len) {
+                        rowFloats[o] = (rowBytes[off] & 0xFF) * INV_255;
+                        rowFloats[o + 1] = (rowBytes[off + 1] & 0xFF) * INV_255;
+                        rowFloats[o + 2] = (rowBytes[off + 2] & 0xFF) * INV_255;
+                    } else {
+                        rowFloats[o] = PAD_VALUE;
+                        rowFloats[o + 1] = PAD_VALUE;
+                        rowFloats[o + 2] = PAD_VALUE;
+                    }
+                    o += 3;
                 }
-                float r = (buffer.get(offset) & 0xFF) * INV_255;
-                float g = (buffer.get(offset + 1) & 0xFF) * INV_255;
-                float b = (buffer.get(offset + 2) & 0xFF) * INV_255;
-
-                int pixelIndex = rowIndex + x;
-                if (isInputNchw) {
-                    floatBufferView.put(pixelIndex, r);
-                    floatBufferView.put(planeSize + pixelIndex, g);
-                    floatBufferView.put(2 * planeSize + pixelIndex, b);
-                } else {
-                    int base = pixelIndex * 3;
-                    floatBufferView.put(base, r);
-                    floatBufferView.put(base + 1, g);
-                    floatBufferView.put(base + 2, b);
+                floatBufferView.position(rowIndex * 3);
+                floatBufferView.put(rowFloats, 0, scaledW * 3);
+            } else {
+                for (int x = 0; x < scaledW; x++) {
+                    int off = sxMap[x] * pixelStride;
+                    if (off + 2 >= len) {
+                        continue;
+                    }
+                    int pixelIndex = rowIndex + x;
+                    floatBufferView.put(pixelIndex, (rowBytes[off] & 0xFF) * INV_255);
+                    floatBufferView.put(planeSize + pixelIndex, (rowBytes[off + 1] & 0xFF) * INV_255);
+                    floatBufferView.put(2 * planeSize + pixelIndex, (rowBytes[off + 2] & 0xFF) * INV_255);
                 }
             }
         }
