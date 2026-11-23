@@ -219,9 +219,10 @@ public class ScreenCaptureService extends Service {
                         )
                         : Collections.emptyList();
 
+                String debugInfo = yoloDetector != null ? yoloDetector.getLastDebug() : "Detector null";
                 overlayView.updateDetections(
                         detections,
-                        "Treffer: " + detections.size() + " | " + captureWidth + "x" + captureHeight
+                        "Treffer: " + detections.size() + " | " + debugInfo
                 );
 
                 if (AutoClickService.isRunning()) {
