@@ -27,7 +27,8 @@ import java.util.List;
 public class ScreenCaptureService extends Service {
 
     private static final String CHANNEL_ID = "target_detector_channel";
-    private static final long MIN_FRAME_INTERVAL_MS = 100; // ca. 10 FPS für KI
+    private static final long MIN_FRAME_INTERVAL_MS = 40; // nur eine kurze Pause zwischen zwei Bildern
+    private static final float CAPTURE_LONG_SIDE = 640f; // lange Bildseite passend zur KI
 
     private MediaProjection mediaProjection;
     private MediaProjection.Callback projectionCallback;
@@ -45,6 +46,7 @@ public class ScreenCaptureService extends Service {
     private int captureWidth;
     private int captureHeight;
     private int screenDensity;
+    private int captureDensity;
     private boolean isResizing = false;
     private long lastProcessTime = 0;
 
@@ -62,9 +64,11 @@ public class ScreenCaptureService extends Service {
         windowManager.getDefaultDisplay().getRealMetrics(metrics);
         screenWidth = metrics.widthPixels;
         screenHeight = metrics.heightPixels;
-        captureWidth = Math.max(1, screenWidth / 2);
-        captureHeight = Math.max(1, screenHeight / 2);
         screenDensity = metrics.densityDpi;
+        float factor = CAPTURE_LONG_SIDE / Math.max(screenWidth, screenHeight);
+        captureWidth = Math.max(1, Math.round(screenWidth * factor));
+        captureHeight = Math.max(1, Math.round(screenHeight * factor));
+        captureDensity = Math.max(1, Math.round(screenDensity * factor));
     }
 
     private void setupOverlay() {
@@ -251,14 +255,14 @@ public class ScreenCaptureService extends Service {
                     "TargetDetectorDisplay",
                     captureWidth,
                     captureHeight,
-                    screenDensity / 2,
+                    captureDensity,
                     DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
                     imageReader.getSurface(),
                     null,
                     handler
             );
         } else {
-            virtualDisplay.resize(captureWidth, captureHeight, screenDensity / 2);
+            virtualDisplay.resize(captureWidth, captureHeight, captureDensity);
             virtualDisplay.setSurface(imageReader.getSurface());
         }
 
@@ -311,4 +315,4 @@ public class ScreenCaptureService extends Service {
     public IBinder onBind(Intent intent) {
         return null;
     }
-}
+                    }
