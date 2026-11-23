@@ -6,7 +6,6 @@ import android.app.NotificationManager;
 import android.app.Service;
 import android.content.Intent;
 import android.content.pm.ServiceInfo;
-import android.graphics.Bitmap;
 import android.graphics.PixelFormat;
 import android.hardware.display.DisplayManager;
 import android.hardware.display.VirtualDisplay;
@@ -200,13 +199,21 @@ public class ScreenCaptureService extends Service {
                 }
                 lastProcessTime = now;
 
-                Bitmap bitmap = imageToBitmap(image);
-                if (bitmap != null) {
-                    List<ColorDetector.Detection> detections =
-                            ColorDetector.detect(bitmap, screenWidth, screenHeight);
-                    overlayView.updateDetections(detections);
-                    bitmap.recycle();
-                }
+                Image.Plane[] planes = image.getPlanes();
+                ByteBuffer buffer = planes[0].getBuffer();
+                int pixelStride = planes[0].getPixelStride();
+                int rowStride = planes[0].getRowStride();
+
+                List<ColorDetector.Detection> detections = ColorDetector.detect(
+                        buffer,
+                        captureWidth,
+                        captureHeight,
+                        pixelStride,
+                        rowStride,
+                        screenWidth,
+                        screenHeight
+                );
+                overlayView.updateDetections(detections);
             } catch (Exception ignored) {
             } finally {
                 if (image != null) {
@@ -236,24 +243,6 @@ public class ScreenCaptureService extends Service {
         if (oldReader != null) {
             oldReader.close();
         }
-    }
-
-    private Bitmap imageToBitmap(Image image) {
-        Image.Plane[] planes = image.getPlanes();
-        ByteBuffer buffer = planes[0].getBuffer();
-        int pixelStride = planes[0].getPixelStride();
-        int rowStride = planes[0].getRowStride();
-        int rowPadding = rowStride - pixelStride * captureWidth;
-
-        Bitmap bitmap = Bitmap.createBitmap(
-                captureWidth + rowPadding / pixelStride,
-                captureHeight,
-                Bitmap.Config.ARGB_8888
-        );
-        bitmap.copyPixelsFromBuffer(buffer);
-        Bitmap cropped = Bitmap.createBitmap(bitmap, 0, 0, captureWidth, captureHeight);
-        bitmap.recycle();
-        return cropped;
     }
 
     private Notification createNotification() {
