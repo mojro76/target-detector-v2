@@ -219,7 +219,10 @@ public class ScreenCaptureService extends Service {
                         )
                         : Collections.emptyList();
 
-                overlayView.updateDetections(detections);
+                overlayView.updateDetections(
+                        detections,
+                        "Treffer: " + detections.size() + " | " + captureWidth + "x" + captureHeight
+                );
 
                 if (AutoClickService.isRunning()) {
                     for (ColorDetector.Detection d : detections) {
@@ -229,7 +232,8 @@ public class ScreenCaptureService extends Service {
                         }
                     }
                 }
-            } catch (Exception ignored) {
+            } catch (Exception e) {
+                overlayView.updateDetections(Collections.emptyList(), "ERR: " + e.getMessage());
             } finally {
                 if (image != null) {
                     image.close();
