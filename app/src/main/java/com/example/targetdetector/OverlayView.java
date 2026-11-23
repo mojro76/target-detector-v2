@@ -12,24 +12,30 @@ import java.util.List;
 
 public class OverlayView extends View {
 
-    // Sättigung ~39% -> klar sichtbar als Grün/Blau/Rot, aber sicher unter der 65%-Schwelle vom ColorDetector
     private static final int COLOR_PLAYER = Color.rgb(155, 255, 155);
     private static final int COLOR_TEAMMATE = Color.rgb(155, 190, 255);
     private static final int COLOR_ENEMY = Color.rgb(255, 155, 155);
 
     private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint textPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private List<ColorDetector.Detection> detections = new ArrayList<>();
+    private String debugText = "Starte...";
 
     public OverlayView(Context context) {
         super(context);
 
         paint.setStyle(Paint.Style.STROKE);
         paint.setStrokeWidth(6f);
+
+        textPaint.setColor(Color.YELLOW);
+        textPaint.setTextSize(42f);
+        textPaint.setShadowLayer(4f, 2f, 2f, Color.BLACK);
     }
 
-    public void updateDetections(List<ColorDetector.Detection> newDetections) {
+    public void updateDetections(List<ColorDetector.Detection> newDetections, String status) {
         post(() -> {
             detections = new ArrayList<>(newDetections);
+            debugText = status;
             invalidate();
         });
     }
@@ -37,6 +43,10 @@ public class OverlayView extends View {
     @Override
     protected void onDraw(Canvas canvas) {
         super.onDraw(canvas);
+
+        if (debugText != null) {
+            canvas.drawText(debugText, 40f, 120f, textPaint);
+        }
 
         if (detections.isEmpty()) {
             return;
