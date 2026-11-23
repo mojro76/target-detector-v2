@@ -21,12 +21,13 @@ import android.util.DisplayMetrics;
 import android.view.WindowManager;
 
 import java.nio.ByteBuffer;
+import java.util.Collections;
 import java.util.List;
 
 public class ScreenCaptureService extends Service {
 
     private static final String CHANNEL_ID = "target_detector_channel";
-    private static final long MIN_FRAME_INTERVAL_MS = 66; // ca. 15 FPS
+    private static final long MIN_FRAME_INTERVAL_MS = 100; // ca. 10 FPS für KI
 
     private MediaProjection mediaProjection;
     private MediaProjection.Callback projectionCallback;
@@ -37,6 +38,7 @@ public class ScreenCaptureService extends Service {
 
     private WindowManager windowManager;
     private OverlayView overlayView;
+    private YoloDetector yoloDetector;
 
     private int screenWidth;
     private int screenHeight;
@@ -50,6 +52,7 @@ public class ScreenCaptureService extends Service {
     public void onCreate() {
         super.onCreate();
         windowManager = (WindowManager) getSystemService(WINDOW_SERVICE);
+        yoloDetector = new YoloDetector(this);
         updateScreenMetrics();
         setupOverlay();
     }
@@ -204,15 +207,18 @@ public class ScreenCaptureService extends Service {
                 int pixelStride = planes[0].getPixelStride();
                 int rowStride = planes[0].getRowStride();
 
-                List<ColorDetector.Detection> detections = ColorDetector.detect(
-                        buffer,
-                        captureWidth,
-                        captureHeight,
-                        pixelStride,
-                        rowStride,
-                        screenWidth,
-                        screenHeight
-                );
+                List<ColorDetector.Detection> detections = yoloDetector != null
+                        ? yoloDetector.detect(
+                                buffer,
+                                captureWidth,
+                                captureHeight,
+                                pixelStride,
+                                rowStride,
+                                screenWidth,
+                                screenHeight
+                        )
+                        : Collections.emptyList();
+
                 overlayView.updateDetections(detections);
 
                 if (AutoClickService.isRunning()) {
@@ -257,7 +263,7 @@ public class ScreenCaptureService extends Service {
     private Notification createNotification() {
         return new Notification.Builder(this, CHANNEL_ID)
                 .setContentTitle("Target Detector läuft")
-                .setContentText("Bildschirmanalyse ist aktiv")
+                .setContentText("KI-Bildschirmanalyse ist aktiv")
                 .setSmallIcon(android.R.drawable.ic_menu_view)
                 .build();
     }
@@ -279,6 +285,10 @@ public class ScreenCaptureService extends Service {
     @Override
     public void onDestroy() {
         cleanupCapture();
+        if (yoloDetector != null) {
+            yoloDetector.close();
+            yoloDetector = null;
+        }
         if (overlayView != null && windowManager != null) {
             windowManager.removeView(overlayView);
             overlayView = null;
