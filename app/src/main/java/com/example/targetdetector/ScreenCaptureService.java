@@ -214,6 +214,15 @@ public class ScreenCaptureService extends Service {
                         screenHeight
                 );
                 overlayView.updateDetections(detections);
+
+                if (AutoClickService.isRunning()) {
+                    for (ColorDetector.Detection d : detections) {
+                        if (d.type == ColorDetector.TargetType.ENEMY) {
+                            AutoClickService.click(d.box.centerX(), d.box.centerY());
+                            break;
+                        }
+                    }
+                }
             } catch (Exception ignored) {
             } finally {
                 if (image != null) {
