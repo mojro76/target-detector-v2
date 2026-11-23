@@ -207,6 +207,7 @@ public class ScreenCaptureService extends Service {
                 int pixelStride = planes[0].getPixelStride();
                 int rowStride = planes[0].getRowStride();
 
+                long t0 = System.nanoTime();
                 List<ColorDetector.Detection> detections = yoloDetector != null
                         ? yoloDetector.detect(
                                 buffer,
@@ -219,10 +220,11 @@ public class ScreenCaptureService extends Service {
                         )
                         : Collections.emptyList();
 
+                long ms = (System.nanoTime() - t0) / 1_000_000;
                 String debugInfo = yoloDetector != null ? yoloDetector.getLastDebug() : "Detector null";
                 overlayView.updateDetections(
                         detections,
-                        "Treffer: " + detections.size() + " | " + debugInfo
+                        "KI: " + ms + " ms | Treffer: " + detections.size() + " | " + debugInfo
                 );
 
                 if (AutoClickService.isRunning()) {
