@@ -6,6 +6,8 @@ import android.graphics.RectF;
 import android.util.Log;
 
 import org.tensorflow.lite.Interpreter;
+import org.tensorflow.lite.gpu.CompatibilityList;
+import org.tensorflow.lite.gpu.GpuDelegate;
 
 import java.io.FileInputStream;
 import java.io.IOException;
@@ -31,6 +33,10 @@ public class YoloDetector {
     private static final float INV_255 = 1f / 255f;
 
     private Interpreter interpreter;
+    private MappedByteBuffer modelBuffer;
+    private GpuDelegate gpuDelegate;
+    private boolean usingGpu = false;
+    private boolean initFailed = false;
     private int inputWidth = 640;
     private int inputHeight = 640;
     private boolean isInputNchw = false;
@@ -70,9 +76,23 @@ public class YoloDetector {
 
     public YoloDetector(Context context) {
         try {
-            Interpreter.Options options = new Interpreter.Options();
-            options.setNumThreads(4);
-            interpreter = new Interpreter(loadModelFile(context), options);
+            // Nur die Modelldatei laden. Der Interpreter wird erst beim ersten Bild
+            // erstellt, weil die GPU auf demselben Thread laufen muss wie die Erkennung.
+            modelBuffer = loadModelFile(context);
+            lastDebug = "Modell geladen";
+        } catch (Exception e) {
+            Log.e(TAG, "Fehler beim Laden von " + MODEL_FILE, e);
+            lastDebug = "LOAD_ERR: " + e.getMessage();
+            initFailed = true;
+        }
+    }
+
+    private void ensureInitialized() {
+        if (interpreter != null || initFailed || modelBuffer == null) {
+            return;
+        }
+        try {
+            interpreter = createInterpreter(true);
 
             int[] inShape = interpreter.getInputTensor(0).shape();
             if (inShape.length == 4) {
@@ -99,12 +119,56 @@ public class YoloDetector {
             inputBuffer = ByteBuffer.allocateDirect(4 * totalFloats);
             inputBuffer.order(ByteOrder.nativeOrder());
             floatBufferView = inputBuffer.asFloatBuffer();
+            lastWidth = -1;
+            lastHeight = -1;
             lastDebug = "OK Ch:" + numChannels + " Box:" + numBoxes;
         } catch (Exception e) {
-            Log.e(TAG, "Fehler beim Laden von " + MODEL_FILE, e);
+            Log.e(TAG, "Fehler beim Starten der KI", e);
             lastDebug = "LOAD_ERR: " + e.getMessage();
-            close();
+            initFailed = true;
+            closeInterpreter();
         }
+    }
+
+    // Versucht zuerst die GPU, bei jedem Problem automatisch Prozessor (CPU)
+    private Interpreter createInterpreter(boolean tryGpu) {
+        if (tryGpu) {
+            try (CompatibilityList compat = new CompatibilityList()) {
+                if (compat.isDelegateSupportedOnThisDevice()) {
+                    Interpreter.Options gpuOptions = new Interpreter.Options();
+                    gpuDelegate = new GpuDelegate(compat.getBestOptionsForThisDevice());
+                    gpuOptions.addDelegate(gpuDelegate);
+                    Interpreter gpuInterpreter = new Interpreter(modelBuffer, gpuOptions);
+                    usingGpu = true;
+                    return gpuInterpreter;
+                }
+            } catch (Throwable t) {
+                Log.e(TAG, "GPU nicht nutzbar, wechsle auf CPU", t);
+                closeGpu();
+            }
+        }
+        usingGpu = false;
+        Interpreter.Options cpuOptions = new Interpreter.Options();
+        cpuOptions.setNumThreads(4);
+        return new Interpreter(modelBuffer, cpuOptions);
+    }
+
+    private void closeGpu() {
+        if (gpuDelegate != null) {
+            try {
+                gpuDelegate.close();
+            } catch (Throwable ignored) {
+            }
+            gpuDelegate = null;
+        }
+    }
+
+    private void closeInterpreter() {
+        if (interpreter != null) {
+            interpreter.close();
+            interpreter = null;
+        }
+        closeGpu();
     }
 
     public String getLastDebug() {
@@ -162,6 +226,7 @@ public class YoloDetector {
             int outputHeight
     ) {
         List<ColorDetector.Detection> results = new ArrayList<>();
+        ensureInitialized();
         if (interpreter == null || outputBuffer == null || buffer == null
                 || width <= 0 || height <= 0 || numChannels <= 4 + TARGET_CLASS_ID) {
             if (interpreter != null && numChannels <= 4 + TARGET_CLASS_ID) {
@@ -211,7 +276,19 @@ public class YoloDetector {
         inputBuffer.rewind();
         long tPre = System.nanoTime();
 
-        interpreter.run(inputBuffer, outputBuffer);
+        try {
+            interpreter.run(inputBuffer, outputBuffer);
+        } catch (RuntimeException e) {
+            if (!usingGpu) {
+                throw e;
+            }
+            // GPU klappt mit diesem Modell nicht: automatisch auf CPU umstellen
+            Log.e(TAG, "GPU-Lauf fehlgeschlagen, wechsle auf CPU", e);
+            closeInterpreter();
+            interpreter = createInterpreter(false);
+            inputBuffer.rewind();
+            interpreter.run(inputBuffer, outputBuffer);
+        }
         long tRun = System.nanoTime();
 
         // Einmalig prüfen, ob Koordinaten normalisiert (0..1) oder in Pixeln (0..640) ausgegeben werden
@@ -310,7 +387,8 @@ public class YoloDetector {
         long tEnd = System.nanoTime();
         lastDebug = String.format(
                 Locale.US,
-                "Vor:%d Modell:%d Nach:%d ms | Enemy:%.2f",
+                "%s Vor:%d Modell:%d Nach:%d ms | Enemy:%.2f",
+                usingGpu ? "GPU" : "CPU",
                 (tPre - tStart) / 1_000_000,
                 (tRun - tPre) / 1_000_000,
                 (tEnd - tRun) / 1_000_000,
@@ -345,9 +423,6 @@ public class YoloDetector {
     }
 
     public synchronized void close() {
-        if (interpreter != null) {
-            interpreter.close();
-            interpreter = null;
-        }
+        closeInterpreter();
     }
 }
