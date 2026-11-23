@@ -1,9 +1,8 @@
 package com.example.targetdetector;
 
-import android.graphics.Bitmap;
-import android.graphics.Color;
 import android.graphics.RectF;
 
+import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -54,36 +53,40 @@ public class ColorDetector {
     }
 
     public static List<Detection> detect(
-            Bitmap bitmap,
+            ByteBuffer buffer,
+            int width,
+            int height,
+            int pixelStride,
+            int rowStride,
             int outputWidth,
             int outputHeight
     ) {
         List<Detection> detections = new ArrayList<>();
-        if (bitmap == null) return detections;
-
-        int width = bitmap.getWidth();
-        int height = bitmap.getHeight();
-
-        int[] pixels = new int[width * height];
-        bitmap.getPixels(pixels, 0, width, 0, 0, width, height);
+        if (buffer == null || width <= 0 || height <= 0) return detections;
 
         float scaleX = (float) outputWidth / width;
         float scaleY = (float) outputHeight / height;
 
-        // step = 3 passt exakt zur halben Aufnahme-Auflösung aus ScreenCaptureService
         int step = 3;
         float mergeDistance = 40f;
         int minHitsRequired = 4;
 
         List<Cluster> clusters = new ArrayList<>();
-        float[] hsv = new float[3];
+        int bufferLimit = buffer.limit();
 
         for (int y = 0; y < height; y += step) {
-            int rowOffset = y * width;
+            int rowOffset = y * rowStride;
             for (int x = 0; x < width; x += step) {
-                int pixel = pixels[rowOffset + x];
-                TargetType type = classify(pixel, hsv);
+                int offset = rowOffset + x * pixelStride;
+                if (offset + 2 >= bufferLimit) {
+                    continue;
+                }
 
+                int r = buffer.get(offset) & 0xFF;
+                int g = buffer.get(offset + 1) & 0xFF;
+                int b = buffer.get(offset + 2) & 0xFF;
+
+                TargetType type = classifyFast(r, g, b);
                 if (type == null) {
                     continue;
                 }
@@ -120,7 +123,6 @@ public class ColorDetector {
             float right = Math.min(outputWidth, c.maxX + padding);
             float bottom = Math.min(outputHeight, c.maxY + padding);
 
-            // Große Flächen / Videos (> 20% der Bildschirmbreite oder -höhe) ignorieren
             float boxWidth = right - left;
             float boxHeight = bottom - top;
             if (boxWidth > outputWidth * 0.20f || boxHeight > outputHeight * 0.20f) {
@@ -162,26 +164,43 @@ public class ColorDetector {
         } while (merged);
     }
 
-    private static TargetType classify(int color, float[] hsv) {
-        Color.colorToHSV(color, hsv);
-
-        float hue = hsv[0];
-        float saturation = hsv[1];
-        float value = hsv[2];
-
-        if (saturation < 0.65f || value < 0.45f) {
+    // Schnelle Ganzzahl-Erkennung (entspricht S >= 65%, V >= 45%)
+    private static TargetType classifyFast(int r, int g, int b) {
+        int max = Math.max(r, Math.max(g, b));
+        if (max < 115) {
             return null;
         }
 
-        if (hue >= 85 && hue <= 155) {
-            return TargetType.PLAYER;
+        int min = Math.min(r, Math.min(g, b));
+        int delta = max - min;
+        if (delta * 100 < max * 65) {
+            return null;
         }
 
-        if (hue >= 190 && hue <= 245) {
-            return TargetType.TEAMMATE;
+        // Grün (PLAYER, Hue ca. 85-155)
+        if (max == g) {
+            if (Math.abs(b - r) * 12 <= delta * 7) {
+                return TargetType.PLAYER;
+            }
+            return null;
         }
 
-        if (hue <= 12 || hue >= 348) {
+        // Blau (TEAMMATE, Hue ca. 190-245)
+        if (max == b) {
+            if (r >= g) {
+                if ((r - g) * 12 <= delta) {
+                    return TargetType.TEAMMATE;
+                }
+            } else {
+                if ((g - r) * 6 <= delta * 5) {
+                    return TargetType.TEAMMATE;
+                }
+            }
+            return null;
+        }
+
+        // Rot (ENEMY, Hue <= 12 oder >= 348)
+        if (Math.abs(g - b) * 5 <= delta) {
             return TargetType.ENEMY;
         }
 
