@@ -27,6 +27,8 @@ public class YoloDetector {
     private static final float CONFIDENCE_THRESHOLD = 0.25f;
     private static final float IOU_THRESHOLD = 0.45f;
     private static final float MAX_BOX_RATIO = 0.20f; // Max. 20 % der Bildschirmbreite/-höhe
+    private static final float PAD_VALUE = 114f / 255f;
+    private static final float INV_255 = 1f / 255f;
 
     private Interpreter interpreter;
     private int inputWidth = 640;
@@ -38,8 +40,21 @@ public class YoloDetector {
 
     private ByteBuffer inputBuffer;
     private FloatBuffer floatBufferView;
-    private float[] floatInput;
     private float[][][] outputBuffer;
+
+    // Layout-Cache (wird nur neu berechnet, wenn sich die Bildgröße ändert)
+    private int lastWidth = -1;
+    private int lastHeight = -1;
+    private float scale = 1f;
+    private int scaledW = 1;
+    private int scaledH = 1;
+    private int padX = 0;
+    private int padY = 0;
+    private int[] sxMap = new int[0];
+    private int[] syMap = new int[0];
+
+    // 0 = unbekannt, 1 = normalisiert (0..1), 2 = Pixel
+    private int coordMode = 0;
 
     private String lastDebug = "Init...";
 
@@ -81,7 +96,6 @@ public class YoloDetector {
             }
 
             int totalFloats = 3 * inputWidth * inputHeight;
-            floatInput = new float[totalFloats];
             inputBuffer = ByteBuffer.allocateDirect(4 * totalFloats);
             inputBuffer.order(ByteOrder.nativeOrder());
             floatBufferView = inputBuffer.asFloatBuffer();
@@ -111,6 +125,33 @@ public class YoloDetector {
         }
     }
 
+    // Berechnet Skalierung, Rand (Letterbox) und Pixel-Zuordnung einmalig pro Bildgröße
+    private void prepareLayout(int width, int height) {
+        scale = Math.min((float) inputWidth / width, (float) inputHeight / height);
+        scaledW = Math.max(1, Math.round(width * scale));
+        scaledH = Math.max(1, Math.round(height * scale));
+        padX = (inputWidth - scaledW) / 2;
+        padY = (inputHeight - scaledH) / 2;
+
+        sxMap = new int[scaledW];
+        for (int x = 0; x < scaledW; x++) {
+            sxMap[x] = Math.min(width - 1, Math.max(0, (int) (x / scale)));
+        }
+        syMap = new int[scaledH];
+        for (int y = 0; y < scaledH; y++) {
+            syMap[y] = Math.min(height - 1, Math.max(0, (int) (y / scale)));
+        }
+
+        // Gesamten Eingabepuffer einmal mit der grauen Randfarbe füllen
+        int totalFloats = 3 * inputWidth * inputHeight;
+        for (int i = 0; i < totalFloats; i++) {
+            floatBufferView.put(i, PAD_VALUE);
+        }
+
+        lastWidth = width;
+        lastHeight = height;
+    }
+
     public synchronized List<ColorDetector.Detection> detect(
             ByteBuffer buffer,
             int width,
@@ -129,68 +170,62 @@ public class YoloDetector {
             return results;
         }
 
-        // Letterbox-Skalierung (Seitenverhältnis bleibt wie beim Training erhalten)
-        float scale = Math.min((float) inputWidth / width, (float) inputHeight / height);
-        int scaledW = Math.max(1, Math.round(width * scale));
-        int scaledH = Math.max(1, Math.round(height * scale));
-        int padX = (inputWidth - scaledW) / 2;
-        int padY = (inputHeight - scaledH) / 2;
+        long tStart = System.nanoTime();
+
+        if (width != lastWidth || height != lastHeight) {
+            prepareLayout(width, height);
+        }
 
         int bufferLimit = buffer.limit();
         int planeSize = inputWidth * inputHeight;
-        float padVal = 114f / 255f;
 
-        for (int iy = 0; iy < inputHeight; iy++) {
-            boolean insideY = iy >= padY && iy < padY + scaledH;
-            int sy = insideY
-                    ? Math.min(height - 1, Math.max(0, (int) ((iy - padY) / scale)))
-                    : 0;
-            int rowOffset = sy * rowStride;
+        // Nur den Bildbereich schreiben, der graue Rand bleibt unverändert
+        for (int y = 0; y < scaledH; y++) {
+            int iy = padY + y;
+            int rowOffset = syMap[y] * rowStride;
+            int rowIndex = iy * inputWidth + padX;
 
-            for (int ix = 0; ix < inputWidth; ix++) {
-                float r = padVal;
-                float g = padVal;
-                float b = padVal;
-
-                if (insideY && ix >= padX && ix < padX + scaledW) {
-                    int sx = Math.min(width - 1, Math.max(0, (int) ((ix - padX) / scale)));
-                    int offset = rowOffset + sx * pixelStride;
-                    if (offset >= 0 && offset + 2 < bufferLimit) {
-                        r = (buffer.get(offset) & 0xFF) / 255.0f;
-                        g = (buffer.get(offset + 1) & 0xFF) / 255.0f;
-                        b = (buffer.get(offset + 2) & 0xFF) / 255.0f;
-                    }
+            for (int x = 0; x < scaledW; x++) {
+                int offset = rowOffset + sxMap[x] * pixelStride;
+                if (offset < 0 || offset + 2 >= bufferLimit) {
+                    continue;
                 }
+                float r = (buffer.get(offset) & 0xFF) * INV_255;
+                float g = (buffer.get(offset + 1) & 0xFF) * INV_255;
+                float b = (buffer.get(offset + 2) & 0xFF) * INV_255;
 
-                int pixelIndex = iy * inputWidth + ix;
+                int pixelIndex = rowIndex + x;
                 if (isInputNchw) {
-                    floatInput[pixelIndex] = r;
-                    floatInput[planeSize + pixelIndex] = g;
-                    floatInput[2 * planeSize + pixelIndex] = b;
+                    floatBufferView.put(pixelIndex, r);
+                    floatBufferView.put(planeSize + pixelIndex, g);
+                    floatBufferView.put(2 * planeSize + pixelIndex, b);
                 } else {
                     int base = pixelIndex * 3;
-                    floatInput[base] = r;
-                    floatInput[base + 1] = g;
-                    floatInput[base + 2] = b;
+                    floatBufferView.put(base, r);
+                    floatBufferView.put(base + 1, g);
+                    floatBufferView.put(base + 2, b);
                 }
             }
         }
 
-        floatBufferView.rewind();
-        floatBufferView.put(floatInput);
         inputBuffer.rewind();
+        long tPre = System.nanoTime();
 
         interpreter.run(inputBuffer, outputBuffer);
+        long tRun = System.nanoTime();
 
-        // Prüfen, ob Koordinaten normalisiert (0..1) oder in Pixeln (0..640) ausgegeben werden
-        float maxCoord = 0f;
-        for (int i = 0; i < numBoxes; i++) {
-            float cx = getOut(0, i);
-            float cy = getOut(1, i);
-            if (cx > maxCoord) maxCoord = cx;
-            if (cy > maxCoord) maxCoord = cy;
+        // Einmalig prüfen, ob Koordinaten normalisiert (0..1) oder in Pixeln (0..640) ausgegeben werden
+        if (coordMode == 0) {
+            float maxCoord = 0f;
+            for (int i = 0; i < numBoxes; i++) {
+                float cx = getOut(0, i);
+                float cy = getOut(1, i);
+                if (cx > maxCoord) maxCoord = cx;
+                if (cy > maxCoord) maxCoord = cy;
+            }
+            coordMode = maxCoord <= 2.0f ? 1 : 2;
         }
-        boolean normalized = maxCoord <= 2.0f;
+        boolean normalized = coordMode == 1;
 
         float scaleToOutX = (float) outputWidth / width;
         float scaleToOutY = (float) outputHeight / height;
@@ -198,26 +233,28 @@ public class YoloDetector {
         float maxBoxHeight = outputHeight * MAX_BOX_RATIO;
         List<Candidate> candidates = new ArrayList<>();
 
-        float globalMaxScore = 0f;
-        int globalBestClass = -1;
+        int enemyChannel = 4 + TARGET_CLASS_ID;
+        float enemyMax = 0f;
 
         for (int i = 0; i < numBoxes; i++) {
-            float maxScore = 0f;
-            int bestClass = -1;
+            // Schnelltest: Enemy-Wert zuerst prüfen, die meisten Boxen fliegen hier raus
+            float enemyScore = getOut(enemyChannel, i);
+            if (enemyScore > enemyMax) {
+                enemyMax = enemyScore;
+            }
+            if (enemyScore < CONFIDENCE_THRESHOLD) {
+                continue;
+            }
+
+            // Enemy muss die beste Klasse dieser Box sein
+            boolean isBest = true;
             for (int c = 4; c < numChannels; c++) {
-                float score = getOut(c, i);
-                if (score > maxScore) {
-                    maxScore = score;
-                    bestClass = c - 4;
+                if (c != enemyChannel && getOut(c, i) > enemyScore) {
+                    isBest = false;
+                    break;
                 }
             }
-
-            if (maxScore > globalMaxScore) {
-                globalMaxScore = maxScore;
-                globalBestClass = bestClass;
-            }
-
-            if (bestClass != TARGET_CLASS_ID || maxScore < CONFIDENCE_THRESHOLD) {
+            if (!isBest) {
                 continue;
             }
 
@@ -250,16 +287,8 @@ public class YoloDetector {
                 continue;
             }
 
-            candidates.add(new Candidate(new RectF(left, top, right, bottom), maxScore));
+            candidates.add(new Candidate(new RectF(left, top, right, bottom), enemyScore));
         }
-
-        lastDebug = String.format(
-                Locale.US,
-                "Ch:%d Max:%.2f Cls:%d",
-                numChannels,
-                globalMaxScore,
-                globalBestClass
-        );
 
         // Doppelte Boxen per NMS herausfiltern
         Collections.sort(candidates, (a, b) -> Float.compare(b.score, a.score));
@@ -277,6 +306,16 @@ public class YoloDetector {
                 results.add(new ColorDetector.Detection(c.box, ColorDetector.TargetType.ENEMY));
             }
         }
+
+        long tEnd = System.nanoTime();
+        lastDebug = String.format(
+                Locale.US,
+                "Vor:%d Modell:%d Nach:%d ms | Enemy:%.2f",
+                (tPre - tStart) / 1_000_000,
+                (tRun - tPre) / 1_000_000,
+                (tEnd - tRun) / 1_000_000,
+                enemyMax
+        );
 
         return results;
     }
