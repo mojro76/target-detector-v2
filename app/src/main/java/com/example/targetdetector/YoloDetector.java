@@ -22,6 +22,7 @@ public class YoloDetector {
 
     private static final String TAG = "YoloDetector";
     private static final String MODEL_FILE = "best.tflite";
+    private static final int TARGET_CLASS_ID = 1; // 1 = Enemy
     private static final float CONFIDENCE_THRESHOLD = 0.35f;
     private static final float IOU_THRESHOLD = 0.45f;
     private static final float MAX_BOX_RATIO = 0.20f; // Max. 20 % der Bildschirmbreite/-höhe
@@ -112,7 +113,7 @@ public class YoloDetector {
     ) {
         List<ColorDetector.Detection> results = new ArrayList<>();
         if (interpreter == null || outputBuffer == null || buffer == null
-                || width <= 0 || height <= 0 || numChannels < 5) {
+                || width <= 0 || height <= 0 || numChannels <= 4 + TARGET_CLASS_ID) {
             return results;
         }
 
@@ -187,14 +188,16 @@ public class YoloDetector {
 
         for (int i = 0; i < numBoxes; i++) {
             float maxScore = 0f;
+            int bestClass = -1;
             for (int c = 4; c < numChannels; c++) {
                 float score = getOut(c, i);
                 if (score > maxScore) {
                     maxScore = score;
+                    bestClass = c - 4;
                 }
             }
 
-            if (maxScore < CONFIDENCE_THRESHOLD) {
+            if (bestClass != TARGET_CLASS_ID || maxScore < CONFIDENCE_THRESHOLD) {
                 continue;
             }
 
