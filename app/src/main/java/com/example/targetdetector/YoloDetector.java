@@ -17,13 +17,14 @@ import java.nio.channels.FileChannel;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Locale;
 
 public class YoloDetector {
 
     private static final String TAG = "YoloDetector";
     private static final String MODEL_FILE = "best.tflite";
     private static final int TARGET_CLASS_ID = 1; // 1 = Enemy
-    private static final float CONFIDENCE_THRESHOLD = 0.35f;
+    private static final float CONFIDENCE_THRESHOLD = 0.25f;
     private static final float IOU_THRESHOLD = 0.45f;
     private static final float MAX_BOX_RATIO = 0.20f; // Max. 20 % der Bildschirmbreite/-höhe
 
@@ -39,6 +40,8 @@ public class YoloDetector {
     private FloatBuffer floatBufferView;
     private float[] floatInput;
     private float[][][] outputBuffer;
+
+    private String lastDebug = "Init...";
 
     private static class Candidate {
         final RectF box;
@@ -82,10 +85,16 @@ public class YoloDetector {
             inputBuffer = ByteBuffer.allocateDirect(4 * totalFloats);
             inputBuffer.order(ByteOrder.nativeOrder());
             floatBufferView = inputBuffer.asFloatBuffer();
+            lastDebug = "OK Ch:" + numChannels + " Box:" + numBoxes;
         } catch (Exception e) {
             Log.e(TAG, "Fehler beim Laden von " + MODEL_FILE, e);
+            lastDebug = "LOAD_ERR: " + e.getMessage();
             close();
         }
+    }
+
+    public String getLastDebug() {
+        return lastDebug;
     }
 
     private MappedByteBuffer loadModelFile(Context context) throws IOException {
@@ -114,6 +123,9 @@ public class YoloDetector {
         List<ColorDetector.Detection> results = new ArrayList<>();
         if (interpreter == null || outputBuffer == null || buffer == null
                 || width <= 0 || height <= 0 || numChannels <= 4 + TARGET_CLASS_ID) {
+            if (interpreter != null && numChannels <= 4 + TARGET_CLASS_ID) {
+                lastDebug = "Zu wenig Kanaele: " + numChannels;
+            }
             return results;
         }
 
@@ -186,6 +198,9 @@ public class YoloDetector {
         float maxBoxHeight = outputHeight * MAX_BOX_RATIO;
         List<Candidate> candidates = new ArrayList<>();
 
+        float globalMaxScore = 0f;
+        int globalBestClass = -1;
+
         for (int i = 0; i < numBoxes; i++) {
             float maxScore = 0f;
             int bestClass = -1;
@@ -195,6 +210,11 @@ public class YoloDetector {
                     maxScore = score;
                     bestClass = c - 4;
                 }
+            }
+
+            if (maxScore > globalMaxScore) {
+                globalMaxScore = maxScore;
+                globalBestClass = bestClass;
             }
 
             if (bestClass != TARGET_CLASS_ID || maxScore < CONFIDENCE_THRESHOLD) {
@@ -232,6 +252,14 @@ public class YoloDetector {
 
             candidates.add(new Candidate(new RectF(left, top, right, bottom), maxScore));
         }
+
+        lastDebug = String.format(
+                Locale.US,
+                "Ch:%d Max:%.2f Cls:%d",
+                numChannels,
+                globalMaxScore,
+                globalBestClass
+        );
 
         // Doppelte Boxen per NMS herausfiltern
         Collections.sort(candidates, (a, b) -> Float.compare(b.score, a.score));
