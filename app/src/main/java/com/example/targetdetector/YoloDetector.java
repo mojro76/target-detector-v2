@@ -24,6 +24,7 @@ public class YoloDetector {
     private static final String MODEL_FILE = "best.tflite";
     private static final float CONFIDENCE_THRESHOLD = 0.35f;
     private static final float IOU_THRESHOLD = 0.45f;
+    private static final float MAX_BOX_RATIO = 0.20f; // Max. 20 % der Bildschirmbreite/-höhe
 
     private Interpreter interpreter;
     private int inputWidth = 640;
@@ -180,6 +181,8 @@ public class YoloDetector {
 
         float scaleToOutX = (float) outputWidth / width;
         float scaleToOutY = (float) outputHeight / height;
+        float maxBoxWidth = outputWidth * MAX_BOX_RATIO;
+        float maxBoxHeight = outputHeight * MAX_BOX_RATIO;
         List<Candidate> candidates = new ArrayList<>();
 
         for (int i = 0; i < numBoxes; i++) {
@@ -217,9 +220,14 @@ public class YoloDetector {
             float right = Math.min(outputWidth, ((x2 - padX) / scale) * scaleToOutX);
             float bottom = Math.min(outputHeight, ((y2 - padY) / scale) * scaleToOutY);
 
-            if (right > left && bottom > top) {
-                candidates.add(new Candidate(new RectF(left, top, right, bottom), maxScore));
+            float boxWidth = right - left;
+            float boxHeight = bottom - top;
+            if (boxWidth <= 0f || boxHeight <= 0f
+                    || boxWidth > maxBoxWidth || boxHeight > maxBoxHeight) {
+                continue;
             }
+
+            candidates.add(new Candidate(new RectF(left, top, right, bottom), maxScore));
         }
 
         // Doppelte Boxen per NMS herausfiltern
