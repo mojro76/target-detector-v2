@@ -25,6 +25,10 @@ public class OverlayView extends View {
     private static final float SIZE_TOLERANCE = 0.15f;
     // Positionsänderungen unter 8 Pixel werden ignoriert (gegen Zittern)
     private static final float CENTER_DEADZONE_PX = 8f;
+    // Länge der Ecken im Verhältnis zur Boxgröße
+    private static final float CORNER_RATIO = 0.25f;
+    // Durchsichtigkeit der Ecken (0 = unsichtbar, 255 = voll sichtbar)
+    private static final int CORNER_ALPHA = 200;
 
     private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint textPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
@@ -37,10 +41,11 @@ public class OverlayView extends View {
 
         paint.setStyle(Paint.Style.STROKE);
         paint.setStrokeWidth(4f);
+        paint.setStrokeCap(Paint.Cap.SQUARE);
 
         textPaint.setColor(Color.YELLOW);
-        textPaint.setTextSize(42f);
-        textPaint.setShadowLayer(4f, 2f, 2f, Color.BLACK);
+        textPaint.setTextSize(30f);
+        textPaint.setShadowLayer(3f, 1f, 1f, Color.BLACK);
     }
 
     public void updateDetections(List<ColorDetector.Detection> newDetections, String status) {
@@ -148,12 +153,30 @@ public class OverlayView extends View {
         return union > 0f ? inter / union : 0f;
     }
 
+    // Zeichnet nur die vier Ecken der Box, damit die KI möglichst wenig vom Overlay sieht
+    private void drawCorners(Canvas canvas, RectF b) {
+        float len = Math.min(b.width(), b.height()) * CORNER_RATIO;
+
+        // oben links
+        canvas.drawLine(b.left, b.top, b.left + len, b.top, paint);
+        canvas.drawLine(b.left, b.top, b.left, b.top + len, paint);
+        // oben rechts
+        canvas.drawLine(b.right, b.top, b.right - len, b.top, paint);
+        canvas.drawLine(b.right, b.top, b.right, b.top + len, paint);
+        // unten links
+        canvas.drawLine(b.left, b.bottom, b.left + len, b.bottom, paint);
+        canvas.drawLine(b.left, b.bottom, b.left, b.bottom - len, paint);
+        // unten rechts
+        canvas.drawLine(b.right, b.bottom, b.right - len, b.bottom, paint);
+        canvas.drawLine(b.right, b.bottom, b.right, b.bottom - len, paint);
+    }
+
     @Override
     protected void onDraw(Canvas canvas) {
         super.onDraw(canvas);
 
         if (debugText != null) {
-            canvas.drawText(debugText, 40f, 120f, textPaint);
+            canvas.drawText(debugText, 40f, 100f, textPaint);
         }
 
         for (ColorDetector.Detection detection : detections) {
@@ -164,7 +187,8 @@ public class OverlayView extends View {
             } else {
                 paint.setColor(COLOR_ENEMY);
             }
-            canvas.drawRect(detection.box, paint);
+            paint.setAlpha(CORNER_ALPHA);
+            drawCorners(canvas, detection.box);
         }
     }
 }
