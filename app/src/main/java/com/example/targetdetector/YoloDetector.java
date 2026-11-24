@@ -29,7 +29,11 @@ public class YoloDetector {
     private static final int ME_CLASS_ID = 5;     // 5 = Me
     private static final float CONFIDENCE_THRESHOLD = 0.25f; // neue Enemy-Boxen brauchen mindestens diesen Wert
     private static final float LOW_THRESHOLD = 0.12f;        // schon bekannte Enemy-Boxen dürfen bis hierher fallen
-    private static final float ME_CONFIDENCE_THRESHOLD = 0.25f;
+    private static final float ME_CONFIDENCE_THRESHOLD = 0.15f; // neue Me-Box braucht mindestens diesen Wert
+    private static final float ME_LOW_THRESHOLD = 0.08f;        // schon bekannte Me-Box darf bis hierher fallen
+    private static final long ME_KEEP_MS = 600;
+    private RectF lastMeBox = null;
+    private long lastMeTime = 0;
     private static final long KEEP_MS = 300;                 // so lange merkt sich die KI die letzten Boxen
     private static final float IOU_THRESHOLD = 0.45f;
     private static final float MAX_BOX_RATIO = 0.20f; // Max. 20 % der Bildschirmbreite/-höhe
@@ -365,11 +369,14 @@ public class YoloDetector {
         int meChannel = 4 + ME_CLASS_ID;
         float enemyMax = 0f;
         RectF bestMeBox = null;
-        float bestMeScore = ME_CONFIDENCE_THRESHOLD;
+        float bestMeScore = ME_LOW_THRESHOLD;
 
         long nowMs = tStart / 1_000_000;
         if (nowMs - lastBoxesTime > KEEP_MS) {
             lastBoxes.clear();
+        }
+        if (nowMs - lastMeTime > ME_KEEP_MS) {
+            lastMeBox = null;
         }
 
         for (int i = 0; i < numBoxes; i++) {
@@ -411,9 +418,10 @@ public class YoloDetector {
             }
 
             if (checkMe) {
+                // Me darf knapp hinter einer anderen Klasse liegen (z. B. Enemy/Teammate), nicht klar dahinter
                 boolean meIsBest = true;
                 for (int c = 4; c < numChannels; c++) {
-                    if (c != meChannel && getOut(c, i) > meScore) {
+                    if (c != meChannel && getOut(c, i) > meScore * 1.25f) {
                         meIsBest = false;
                         break;
                     }
@@ -423,7 +431,8 @@ public class YoloDetector {
                         decodedBox = decodeBox(i, normalized, scaleToOutX, scaleToOutY,
                                 outputWidth, outputHeight, maxBoxWidth, maxBoxHeight);
                     }
-                    if (decodedBox != null) {
+                    if (decodedBox != null
+                            && (meScore >= ME_CONFIDENCE_THRESHOLD || nearLastMe(decodedBox))) {
                         bestMeScore = meScore;
                         bestMeBox = decodedBox;
                     }
@@ -450,6 +459,8 @@ public class YoloDetector {
 
         // Eigene Position (Me) am Ende anfügen, damit bestehende Zugriffe auf Enemy zuerst kommen
         if (bestMeBox != null) {
+            lastMeBox = bestMeBox;
+            lastMeTime = nowMs;
             results.add(new ColorDetector.Detection(bestMeBox, ColorDetector.TargetType.PLAYER));
         }
 
@@ -516,6 +527,10 @@ public class YoloDetector {
             return null;
         }
         return new RectF(left, top, right, bottom);
+    }
+
+    private boolean nearLastMe(RectF box) {
+        return lastMeBox != null && calculateIoU(box, lastMeBox) > 0.2f;
     }
 
     private boolean nearPreviousBox(RectF box) {
