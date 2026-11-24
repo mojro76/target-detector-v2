@@ -37,6 +37,19 @@ public class YoloDetector {
     private static final float RING_Y_MAX = 0.97f;
     private static final float UI_X = 0.65f;   // rechts davon UND ...
     private static final float UI_Y = 0.62f;   // ... unterhalb davon wird nicht gesucht (Knöpfe)
+    // Rote Gegner-Ringe: etwas breiter suchen, aber den roten Zielknopf rechts großzügig auslassen
+    private static final float RED_X_MIN = 0.03f;
+    private static final float RED_X_MAX = 0.97f;
+    private static final float RED_UI_X = 0.72f;
+    private static final float RED_UI_Y = 0.40f;
+    // Strengere Form für rote Ringe (gegen rote Deko am Rand, Effekte usw.)
+    private static final float RED_MIN_W = 0.0375f;
+    private static final float RED_MAX_W = 0.0625f;
+    private static final float RED_MIN_H = 0.066f;
+    private static final float RED_MIN_ASPECT = 1.1f;
+    private static final float RED_MAX_ASPECT = 1.45f;
+    private static final float RED_CENTER_X_MIN = 0.12f;
+    private static final float RED_CENTER_X_MAX = 0.88f;
     // Form des Rings (Anteil von Bildbreite/-höhe)
     private static final float RING_MIN_W = 0.030f;
     private static final float RING_MAX_W = 0.066f;    // Ring ist im Spiel immer etwa gleich groß; größere grüne Flächen (z. B. Spielfeldlinien) fliegen raus
@@ -45,7 +58,7 @@ public class YoloDetector {
     private static final float RING_MAX_ASPECT = 4.2f;
     private static final int RING_MIN_PIXELS = 20;
     private static final float RING_MAX_INNER_FILL = 0.45f; // höchstens so viel Grün innen im Ring
-    // Aus dem Ring wird die Box meiner Figur gebaut: so hoch wie 1,5 x Ringbreite
+    // Aus einem Ring wird die Box der Figur gebaut: so hoch wie 1,5 x Ringbreite
     private static final float ME_BOX_HEIGHT = 1.5f;
     private static final long RING_KEEP_MS = 500;
 
@@ -55,6 +68,7 @@ public class YoloDetector {
     private float lastRingCy = -1f;
     private long lastRingTime = 0;
     private int lastRingPixels = 0;
+    private int lastRedAdded = 0;
 
     private static final long KEEP_MS = 300;                 // so lange merkt sich die KI die letzten Boxen
     private static final float IOU_THRESHOLD = 0.45f;
@@ -447,13 +461,7 @@ public class YoloDetector {
         RectF meBox = null;
         RectF ring = findMeRing(width, height, pixelStride, rowStride, bufferLimit, nowMs);
         if (ring != null) {
-            float w = ring.width();
-            float cx = ring.centerX();
-            float left = (cx - w * 0.5f) * scaleToOutX;
-            float right = (cx + w * 0.5f) * scaleToOutX;
-            float bottom = ring.bottom * scaleToOutY;
-            float top = (ring.bottom - w * ME_BOX_HEIGHT) * scaleToOutY;
-            meBox = new RectF(left, Math.max(0f, top), right, bottom);
+            meBox = boxFromRing(ring, scaleToOutX, scaleToOutY);
 
             // Hält die KI mich selbst für einen Gegner, wird diese Gegner-Box entfernt
             for (int k = kept.size() - 1; k >= 0; k--) {
@@ -466,6 +474,30 @@ public class YoloDetector {
         for (Candidate k : kept) {
             results.add(new ColorDetector.Detection(k.box, ColorDetector.TargetType.ENEMY));
         }
+
+        // Rote Ringe = Gegner. Nur ergänzen, wo die KI selbst keinen Gegner gefunden hat.
+        lastRedAdded = 0;
+        List<Ring> redRings = findRings(true, width, height, pixelStride, rowStride, bufferLimit);
+        for (Ring red : redRings) {
+            RectF eb = boxFromRing(red.box, scaleToOutX, scaleToOutY);
+            boolean known = false;
+            for (Candidate k : kept) {
+                if (k.box.contains(eb.centerX(), eb.centerY())
+                        || eb.contains(k.box.centerX(), k.box.centerY())
+                        || calculateIoU(k.box, eb) > 0.1f) {
+                    known = true;
+                    break;
+                }
+            }
+            if (!known && meBox != null && calculateIoU(meBox, eb) > 0.3f) {
+                known = true;
+            }
+            if (!known) {
+                results.add(new ColorDetector.Detection(eb, ColorDetector.TargetType.ENEMY));
+                lastRedAdded++;
+            }
+        }
+
         if (meBox != null) {
             results.add(new ColorDetector.Detection(meBox, ColorDetector.TargetType.PLAYER));
         }
@@ -482,14 +514,15 @@ public class YoloDetector {
         long tEnd = System.nanoTime();
         lastDebug = String.format(
                 Locale.US,
-                "%s Kopie:%d Umr:%d Modell:%d Nach:%d ms | Enemy:%.2f Ring:%d",
+                "%s Kopie:%d Umr:%d Modell:%d Nach:%d ms | Enemy:%.2f Ring:%d Rot:+%d",
                 usingGpu ? "GPU" : "CPU",
                 (tCopy - tStart) / 1_000_000,
                 (tPre - tCopy) / 1_000_000,
                 (tRun - tPre) / 1_000_000,
                 (tEnd - tRun) / 1_000_000,
                 enemyMax,
-                lastRingPixels
+                lastRingPixels,
+                lastRedAdded
         );
 
         return results;
@@ -541,7 +574,23 @@ public class YoloDetector {
         return r >= 40 && r <= 210 && g >= 150 && g - r >= 70 && g - b >= 70;
     }
 
-    // Ein Ring ist innen größtenteils nicht grün (dort stehe ich). Ein Busch ist innen voll grün.
+    // Kräftiges Rot des Gegner-Rings. Pinke Blöcke haben deutlich mehr Blau und fliegen raus
+    private static boolean isRingRed(int r, int g, int b) {
+        return r >= 200 && r - g >= 110 && r - b >= 90 && b <= 130;
+    }
+
+    // Ein gefundener Ring: Umrandung in Bildpixeln und Anzahl seiner Pixel
+    private static class Ring {
+        final RectF box;
+        final int pixels;
+
+        Ring(RectF box, int pixels) {
+            this.box = box;
+            this.pixels = pixels;
+        }
+    }
+
+    // Ein Ring ist innen größtenteils nicht farbig (dort steht die Figur). Ein Busch oder Block ist innen voll.
     private boolean isHollow(int minX, int minY, int maxX, int maxY, int width) {
         int w = maxX - minX + 1;
         int h = maxY - minY + 1;
@@ -550,34 +599,36 @@ public class YoloDetector {
         int iy0 = minY + (int) (h * 0.3f);
         int iy1 = maxY - (int) (h * 0.3f);
         int total = 0;
-        int green = 0;
+        int filled = 0;
         for (int y = iy0; y <= iy1; y++) {
             for (int x = ix0; x <= ix1; x++) {
                 total++;
                 if (ringMask[y * width + x] != 0) {
-                    green++;
+                    filled++;
                 }
             }
         }
-        return total > 0 && green < total * RING_MAX_INNER_FILL;
+        return total > 0 && filled < total * RING_MAX_INNER_FILL;
     }
 
-    // Sucht den grünen Ring unter meiner Figur. Liefert seine Umrandung in Bildpixeln oder null.
-    private RectF findMeRing(int width, int height, int pixelStride, int rowStride, int limit, long nowMs) {
+    // Sucht alle ringförmigen Flecken in einer Farbe (grün = ich, rot = Gegner)
+    private List<Ring> findRings(boolean red, int width, int height, int pixelStride, int rowStride, int limit) {
+        List<Ring> rings = new ArrayList<>();
         int n = width * height;
         if (ringMask.length < n) {
             ringMask = new byte[n];
             ringStack = new int[n];
         }
 
-        int x0 = (int) (width * RING_X_MIN);
-        int x1 = (int) (width * RING_X_MAX);
+        int x0 = (int) (width * (red ? RED_X_MIN : RING_X_MIN));
+        int x1 = (int) (width * (red ? RED_X_MAX : RING_X_MAX));
         int y0 = (int) (height * RING_Y_MIN);
         int y1 = (int) (height * RING_Y_MAX);
-        int uiX = (int) (width * UI_X);
-        int uiY = (int) (height * UI_Y);
+        // Bereich unten rechts mit den Knöpfen (beim Rot größer wegen des roten Zielknopfs)
+        int uiX = (int) (width * (red ? RED_UI_X : UI_X));
+        int uiY = (int) (height * (red ? RED_UI_Y : UI_Y));
 
-        // Schritt 1: alle hellgrünen Pixel markieren
+        // Schritt 1: alle Pixel in der gesuchten Farbe markieren
         for (int y = y0; y < y1; y++) {
             int rowStart = y * rowStride;
             int base = y * width;
@@ -589,7 +640,7 @@ public class YoloDetector {
                         int r = frameBytes[idx] & 0xFF;
                         int g = frameBytes[idx + 1] & 0xFF;
                         int b = frameBytes[idx + 2] & 0xFF;
-                        if (isRingGreen(r, g, b)) {
+                        if (red ? isRingRed(r, g, b) : isRingGreen(r, g, b)) {
                             m = 1;
                         }
                     }
@@ -598,16 +649,11 @@ public class YoloDetector {
             }
         }
 
-        boolean hasLast = lastRingCx >= 0f && nowMs - lastRingTime <= RING_KEEP_MS;
         float minW = width * RING_MIN_W;
         float maxW = width * RING_MAX_W;
         float minH = height * RING_MIN_H;
 
-        RectF best = null;
-        float bestScore = 0f;
-        int bestPixels = 0;
-
-        // Schritt 2: zusammenhängende grüne Flecken finden und den ringförmigsten nehmen
+        // Schritt 2: zusammenhängende Flecken finden und nur ringförmige behalten
         for (int y = y0; y < y1; y++) {
             for (int x = x0; x < x1; x++) {
                 int start = y * width + x;
@@ -655,29 +701,47 @@ public class YoloDetector {
                         || aspect < RING_MIN_ASPECT || aspect > RING_MAX_ASPECT) {
                     continue;
                 }
-
-                float cx = (minX + maxX) * 0.5f;
-                float cy = (minY + maxY) * 0.5f;
-
-                // Ring muss innen hohl sein, sonst ist es ein Busch o. Ä.
+                // Gegner-Ringe sind genauso groß wie meiner und leicht oval. Rote Deko hat andere Formen.
+                if (red) {
+                    float cxRel = (minX + maxX) * 0.5f / width;
+                    if (w < width * RED_MIN_W || w > width * RED_MAX_W || h < height * RED_MIN_H
+                            || aspect < RED_MIN_ASPECT || aspect > RED_MAX_ASPECT
+                            || cxRel < RED_CENTER_X_MIN || cxRel > RED_CENTER_X_MAX) {
+                        continue;
+                    }
+                }
+                // Ring muss innen hohl sein, sonst ist es ein Busch, Block o. Ä.
                 if (!isHollow(minX, minY, maxX, maxY, width)) {
                     continue;
                 }
-                float score = count;
-                // Nah an der letzten Ring-Position: sehr wahrscheinlich wieder ich
-                if (hasLast && Math.hypot(cx - lastRingCx, cy - lastRingCy) < w) {
-                    score *= 3f;
-                }
-                // Etwas Vorrang für die Bildmitte (Kamera folgt mir)
-                float dxc = cx / width - 0.5f;
-                float dyc = cy / height - 0.55f;
-                score *= 1.5f - Math.min(1f, (float) Math.hypot(dxc, dyc));
+                rings.add(new Ring(new RectF(minX, minY, maxX + 1, maxY + 1), count));
+            }
+        }
+        return rings;
+    }
 
-                if (score > bestScore) {
-                    bestScore = score;
-                    bestPixels = count;
-                    best = new RectF(minX, minY, maxX + 1, maxY + 1);
-                }
+    // Wählt aus allen grünen Ringen meinen aus (bevorzugt nahe der letzten Position und der Bildmitte)
+    private RectF findMeRing(int width, int height, int pixelStride, int rowStride, int limit, long nowMs) {
+        List<Ring> rings = findRings(false, width, height, pixelStride, rowStride, limit);
+        boolean hasLast = lastRingCx >= 0f && nowMs - lastRingTime <= RING_KEEP_MS;
+
+        RectF best = null;
+        float bestScore = 0f;
+        int bestPixels = 0;
+        for (Ring ring : rings) {
+            float cx = ring.box.centerX();
+            float cy = ring.box.centerY();
+            float score = ring.pixels;
+            if (hasLast && Math.hypot(cx - lastRingCx, cy - lastRingCy) < ring.box.width()) {
+                score *= 3f;
+            }
+            float dxc = cx / width - 0.5f;
+            float dyc = cy / height - 0.55f;
+            score *= 1.5f - Math.min(1f, (float) Math.hypot(dxc, dyc));
+            if (score > bestScore) {
+                bestScore = score;
+                bestPixels = ring.pixels;
+                best = ring.box;
             }
         }
 
@@ -688,6 +752,17 @@ public class YoloDetector {
         }
         lastRingPixels = bestPixels;
         return best;
+    }
+
+    // Baut aus einem Ring (Bildpixel) die Box der Figur darüber (Bildschirmpixel)
+    private static RectF boxFromRing(RectF ring, float scaleX, float scaleY) {
+        float w = ring.width();
+        float cx = ring.centerX();
+        float left = (cx - w * 0.5f) * scaleX;
+        float right = (cx + w * 0.5f) * scaleX;
+        float bottom = ring.bottom * scaleY;
+        float top = (ring.bottom - w * ME_BOX_HEIGHT) * scaleY;
+        return new RectF(left, Math.max(0f, top), right, bottom);
     }
 
     private boolean nearPreviousBox(RectF box) {
