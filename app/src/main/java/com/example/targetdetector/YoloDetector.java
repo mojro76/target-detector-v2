@@ -42,6 +42,9 @@ public class YoloDetector {
     private static final float RED_X_MAX = 0.97f;
     private static final float RED_UI_X = 0.72f;
     private static final float RED_UI_Y = 0.40f;
+    // Zusätzlich unten rechts (Super- und Gadget-Knopf mit rot-orangem Rand)
+    private static final float RED_BTN_X = 0.55f;
+    private static final float RED_BTN_Y = 0.62f;
     // Ecke unten links wird für Rot nicht durchsucht (Plakate/Werbebanden, Bewegungs-Joystick)
     private static final float RED_LEFT_X = 0.25f;
     private static final float RED_BOTTOM_Y = 0.70f;
@@ -76,10 +79,11 @@ public class YoloDetector {
     private float lastGoodRingW = 0f;
 
     // ===== Gegner weiterverfolgen, wenn KI und Ring kurz ausfallen (Treffer-Effekte, Busch) =====
-    private static final long TRACK_MAX_MS = 1000;     // so lange darf ein Gegner nur per Bildvergleich verfolgt werden
+    private static final long TRACK_MAX_MS = 600;      // so lange darf ein Gegner nur per Bildvergleich verfolgt werden
     private static final int TRACK_MIN_HITS = 3;       // nur Gegner, die vorher mehrmals sicher erkannt wurden
-    private static final float TRACK_MAX_DIFF = 18f;   // mittlere Grauwert-Abweichung, ab der "nicht mehr gefunden" gilt
-    private static final int TRACK_PIXEL_CAP = 40;     // höchstens so viel zählt ein einzelnes Pixel
+    private static final float TRACK_MAX_DIFF = 20f;   // mittlere Grauwert-Abweichung, ab der "nicht mehr gefunden" gilt
+    private static final int TRACK_PIXEL_CAP = 60;     // höchstens so viel zählt ein einzelnes Pixel
+    private static final float TRACK_SIDE_CUT = 0.2f;  // links/rechts so viel der Box weglassen (Hintergrund)
     private static final int TRACK_MAX = 6;            // höchstens so viele Gegner gleichzeitig verfolgen
 
     private static class Track {
@@ -87,6 +91,8 @@ public class YoloDetector {
         byte[] tpl;         // Graubild-Ausschnitt (jedes 2. Pixel)
         int tw;
         int th;
+        float tplOffX;      // Abstand des Ausschnitts zur Box-Ecke
+        float tplOffY;
         int hits;
         long lastDetected;
     }
@@ -663,6 +669,8 @@ public class YoloDetector {
         int uiX = (int) (width * (red ? RED_UI_X : UI_X));
         int uiY = (int) (height * (red ? RED_UI_Y : UI_Y));
         int leftX = (int) (width * RED_LEFT_X);
+        int btnX = (int) (width * RED_BTN_X);
+        int btnY = (int) (height * RED_BTN_Y);
         int bottomY = (int) (height * RED_BOTTOM_Y);
 
         // Schritt 1: alle Pixel in der gesuchten Farbe markieren
@@ -672,7 +680,8 @@ public class YoloDetector {
             for (int x = x0; x < x1; x++) {
                 byte m = 0;
                 boolean skip = (x > uiX && y > uiY)
-                        || (red && x < leftX && y > bottomY);
+                        || (red && x < leftX && y > bottomY)
+                        || (red && x > btnX && y > btnY);
                 if (!skip) {
                     int idx = rowStart + x * pixelStride;
                     if (idx + 2 < limit) {
@@ -820,9 +829,12 @@ public class YoloDetector {
 
     // Merkt sich das aktuelle Aussehen des Gegners (jedes 2. Pixel als Graubild)
     private void captureTemplate(Track t, int width, int height, int pixelStride, int rowStride, int limit) {
-        int x0 = Math.max(0, (int) t.box.left);
+        // Nur die innere Mitte der Box merken (die Figur selbst). Der Rand ist meist Boden/Busch
+        // und würde sonst auch dann noch passen, wenn der Gegner längst weg ist.
+        float bw = t.box.width();
+        int x0 = Math.max(0, (int) (t.box.left + bw * TRACK_SIDE_CUT));
         int y0 = Math.max(0, (int) t.box.top);
-        int x1 = Math.min(width - 1, (int) t.box.right);
+        int x1 = Math.min(width - 1, (int) (t.box.right - bw * TRACK_SIDE_CUT));
         int y1 = Math.min(height - 1, (int) t.box.bottom);
         int tw = (x1 - x0) / 2;
         int th = (y1 - y0) / 2;
@@ -839,7 +851,8 @@ public class YoloDetector {
         t.tpl = tpl;
         t.tw = tw;
         t.th = th;
-        t.box = new RectF(x0, y0, x0 + 2 * tw, y0 + 2 * th);
+        t.tplOffX = x0 - t.box.left;   // Lage des Ausschnitts innerhalb der Box merken
+        t.tplOffY = y0 - t.box.top;
     }
 
     // Abweichung des gemerkten Aussehens an Position (x0, y0); bricht ab, sobald es schlechter als limitSad wird
@@ -867,9 +880,9 @@ public class YoloDetector {
     private RectF findByTemplate(Track t, int width, int height, int pixelStride, int rowStride, int limit) {
         int bw = 2 * t.tw;
         int bh = 2 * t.th;
-        int sx = (int) t.box.left;
-        int sy = (int) t.box.top;
-        int range = Math.max(6, (int) (bw * 0.6f));
+        int sx = (int) (t.box.left + t.tplOffX);
+        int sy = (int) (t.box.top + t.tplOffY);
+        int range = Math.max(6, (int) (t.box.width() * 0.5f));
 
         long best = Long.MAX_VALUE;
         int bestX = sx;
@@ -915,7 +928,9 @@ public class YoloDetector {
         if (meanDiff > TRACK_MAX_DIFF) {
             return null; // nicht mehr gefunden (z. B. unsichtbar im Busch)
         }
-        return new RectF(bestX, bestY, bestX + bw, bestY + bh);
+        float dx = bestX - sx;
+        float dy = bestY - sy;
+        return new RectF(t.box.left + dx, t.box.top + dy, t.box.right + dx, t.box.bottom + dy);
     }
 
     // Ordnet die Gegner dieses Bildes den bekannten Gegnern zu und verfolgt verlorene weiter
