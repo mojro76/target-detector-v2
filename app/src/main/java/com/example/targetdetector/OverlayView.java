@@ -15,7 +15,7 @@ public class OverlayView extends View {
 
     private static final int COLOR_PLAYER = Color.rgb(155, 255, 155);
     private static final int COLOR_TEAMMATE = Color.rgb(155, 190, 255);
-    private static final int COLOR_ENEMY = Color.rgb(255, 155, 155);
+    private static final int COLOR_ENEMY = Color.rgb(255, 110, 110);
     private static final int COLOR_AIM_LINE = Color.rgb(255, 190, 40); // gelb-orange
 
     // Findet die KI in einem Bild gar nichts, bleiben die letzten Boxen so lange stehen (gegen Flackern)
@@ -29,12 +29,12 @@ public class OverlayView extends View {
     // Länge der Ecken im Verhältnis zur Boxgröße
     private static final float CORNER_RATIO = 0.35f;
     // Durchsichtigkeit der Ecken (0 = unsichtbar, 255 = voll sichtbar)
-    private static final int CORNER_ALPHA = 235;
+    private static final int CORNER_ALPHA = 245;
 
     // Zielpunkt bei 65 % der Boxhöhe von oben (Körper statt Name/Lebensbalken)
     private static final float AIM_Y_FACTOR = 0.65f;
     // Wird "Ich" von der KI mal nicht erkannt, bleibt die letzte Position so lange als Linienstart gültig
-    private static final long ME_HOLD_MS = 900;
+    private static final long ME_HOLD_MS = 600;
     // Ziellinie: dünn und leicht durchsichtig, damit die KI sie kaum sieht
     private static final float AIM_LINE_WIDTH = 3f;
     private static final int AIM_LINE_ALPHA = 170;
@@ -74,12 +74,17 @@ public class OverlayView extends View {
 
             // "Ich" getrennt von den Gegnern behandeln, damit die Linie nicht abreißt
             List<ColorDetector.Detection> others = new ArrayList<>();
+            RectF freshMe = null;
             for (ColorDetector.Detection d : filtered) {
                 if (isMe(d.type)) {
-                    updateMe(d.box, now);
+                    freshMe = d.box;
                 } else {
                     others.add(d);
                 }
+            }
+            // Sicherheitsnetz: liegt "Ich" auf einem Gegner, ist es keine echte Position von mir
+            if (freshMe != null && !overlapsEnemy(freshMe, others)) {
+                updateMe(freshMe, now);
             }
 
             if (!others.isEmpty()) {
@@ -91,6 +96,20 @@ public class OverlayView extends View {
             }
             invalidate();
         });
+    }
+
+    private static boolean overlapsEnemy(RectF me, List<ColorDetector.Detection> list) {
+        for (ColorDetector.Detection d : list) {
+            if (d.type != ColorDetector.TargetType.ENEMY) {
+                continue;
+            }
+            if (iou(me, d.box) > 0.25f
+                    || d.box.contains(me.centerX(), me.centerY())
+                    || me.contains(d.box.centerX(), d.box.centerY())) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private void updateMe(RectF fresh, long now) {
