@@ -72,18 +72,41 @@ public class YoloDetector {
     private static final float ME_BOX_HEIGHT = 1.5f;
     private static final long RING_KEEP_MS = 500;
 
+    // ===== Ring per Ellipse mit FESTER Größe finden =====
+    // Der Ring ist immer gleich groß. Seine Größe wird einmal gelernt (Mittelwert über viele Bilder),
+    // danach wird eine Ellipse genau dieser Größe auf die grünen Pixel gelegt. Das klappt auch,
+    // wenn der Ring zerstückelt ist (Tor-Netz, Busch, Figur davor, Teamkamerad daneben).
+    // Alle Boxen (ich und Gegner) bekommen diese feste Größe -> kein Schrumpfen/Pumpen mehr.
+    private static final float RING_ASPECT = 1.28f;        // Ring ist so viel breiter als hoch (gemessen)
+    private static final float RING_BOX_SCALE = 1.06f;     // gelernte Größe -> sichtbarer Außenrand des Rings
+    private static final float RING_SCORE_LOCAL = 0.30f;   // Mindestwert nahe meiner letzten Position
+    private static final float RING_SCORE_GLOBAL = 0.45f;  // Mindestwert irgendwo im Bild (strenger)
+    private static final float RING_SCORE_SIZE = 0.50f;    // nur so gute Treffer verbessern die Größe
+    private static final float RING_SCORE_BOOT = 0.55f;    // Mindestwert beim ersten Lernen der Größe
+    private static final long RING_LOCAL_MS = 1500;       // so lange wird zuerst nahe der letzten Position gesucht
+    private static final long RING_RESET_MS = 5000;       // so lange nichts gefunden -> Größe neu lernen (neue Karte)
+    private static final int SIZE_HISTORY = 31;            // Größe = Mittelwert (Median) der letzten so vielen Messungen
+    private static final int BOOT_SAMPLES = 3;             // so viele gute Messungen braucht das erste Lernen
+    private static final int GLOBAL_CHECK_EVERY = 4;       // jedes 4. Bild zusätzlich im ganzen Bild nachsehen
+
     private byte[] ringMask = new byte[0];
     private int[] ringStack = new int[0];
+    private byte[] greenMask = new byte[0];
     private float lastRingCx = -1f;
     private float lastRingCy = -1f;
     private long lastRingTime = 0;
-    private int lastRingPixels = 0;
     private int lastRedAdded = 0;
-    // Suchfenster für den blassen Ring im Busch (null = normale Suche)
-    private RectF weakWindow = null;
-    private static final long RING_WEAK_MS = 1500;     // so lange nach dem letzten Treffer darf im Busch weitergesucht werden
-    // Breite meines letzten vollständigen Rings (gegen halbe Ringe bei Explosionen)
+    // Breite meines letzten vollständigen Rings (nur fürs erste Lernen, gegen halbe Ringe)
     private float lastGoodRingW = 0f;
+
+    private float ringW = 0f;                 // gelernte Ringbreite in Bildpixeln (0 = noch unbekannt)
+    private final List<Float> sizeHistory = new ArrayList<>();
+    private int[][] ellOffsets = null;        // Merker: Ellipse für ringW schon gebaut?
+    private float ellForW = -1f;
+    private int ellForWidth = -1;
+    private long lastMatchTime = 0;
+    private int frameCounter = 0;
+    private float lastRingScore = 0f;
 
     // ===== Gegner weiterverfolgen, wenn KI und Ring kurz ausfallen (Treffer-Effekte, Busch) =====
     private static final long TRACK_MAX_MS = 400;      // so lange darf ein Gegner nur per Bildvergleich verfolgt werden
@@ -512,7 +535,7 @@ public class YoloDetector {
         List<RectF> enemyOut = new ArrayList<>();
         List<Boolean> enemySure = new ArrayList<>();   // sicher erkannt? (nur solche Gegner dürfen später verfolgt werden)
         for (Candidate k : kept) {
-            enemyOut.add(k.box);
+            enemyOut.add(normalizeBox(k.box, scaleToOutX, scaleToOutY));
             enemySure.add(k.score >= TRACK_SURE_SCORE);
         }
 
@@ -534,7 +557,7 @@ public class YoloDetector {
                 known = true;
             }
             if (!known) {
-                enemyOut.add(eb);
+                enemyOut.add(normalizeBox(eb, scaleToOutX, scaleToOutY));
                 enemySure.add(true);
                 lastRedAdded++;
             }
@@ -572,14 +595,15 @@ public class YoloDetector {
         long tEnd = System.nanoTime();
         lastDebug = String.format(
                 Locale.US,
-                "%s Kopie:%d Umr:%d Modell:%d Nach:%d ms | Enemy:%.2f Ring:%d Rot:+%d Verf:+%d",
+                "%s Kopie:%d Umr:%d Modell:%d Nach:%d ms | Enemy:%.2f Ring:%d%% Gr:%.0f Rot:+%d Verf:+%d",
                 usingGpu ? "GPU" : "CPU",
                 (tCopy - tStart) / 1_000_000,
                 (tPre - tCopy) / 1_000_000,
                 (tRun - tPre) / 1_000_000,
                 (tEnd - tRun) / 1_000_000,
                 enemyMax,
-                lastRingPixels,
+                Math.round(lastRingScore * 100f),
+                ringW,
                 lastRedAdded,
                 lastTracked
         );
@@ -633,12 +657,6 @@ public class YoloDetector {
         return r >= 40 && r <= 210 && b >= 25 && g >= 150 && g - r >= 70 && g - b >= 70;
     }
 
-    // Blasseres Grün: so sieht mein Ring im Busch aus. Nur nahe meiner letzten Position erlaubt,
-    // Büsche selbst haben kaum Rot und Blau und fallen trotzdem raus.
-    private static boolean isRingGreenWeak(int r, int g, int b) {
-        return r >= 45 && r <= 200 && b >= 25 && g >= 95 && g - r >= 45 && g - b >= 25;
-    }
-
     // Kräftiges Rot des Gegner-Rings. Pinke Blöcke haben deutlich mehr Blau und fliegen raus
     private static boolean isRingRed(int r, int g, int b) {
         return r >= 200 && r - g >= 110 && r - b >= 90 && b <= 130;
@@ -689,17 +707,6 @@ public class YoloDetector {
         int x1 = (int) (width * (red ? RED_X_MAX : RING_X_MAX));
         int y0 = (int) (height * RING_Y_MIN);
         int y1 = (int) (height * RING_Y_MAX);
-        boolean weak = !red && weakWindow != null;
-        if (weak) {
-            // Zweiter Versuch im Busch: nur im Fenster um meine letzte Position suchen
-            x0 = Math.max(x0, (int) weakWindow.left);
-            x1 = Math.min(x1, (int) weakWindow.right);
-            y0 = Math.max(y0, (int) weakWindow.top);
-            y1 = Math.min(y1, (int) weakWindow.bottom);
-            if (x1 <= x0 || y1 <= y0) {
-                return rings;
-            }
-        }
         // Bereich unten rechts mit den Knöpfen (beim Rot größer wegen des roten Zielknopfs)
         int uiX = (int) (width * (red ? RED_UI_X : UI_X));
         int uiY = (int) (height * (red ? RED_UI_Y : UI_Y));
@@ -723,7 +730,7 @@ public class YoloDetector {
                         int r = frameBytes[idx] & 0xFF;
                         int g = frameBytes[idx + 1] & 0xFF;
                         int b = frameBytes[idx + 2] & 0xFF;
-                        if (red ? isRingRed(r, g, b) : (weak ? isRingGreenWeak(r, g, b) : isRingGreen(r, g, b))) {
+                        if (red ? isRingRed(r, g, b) : isRingGreen(r, g, b)) {
                             m = 1;
                         }
                     }
@@ -790,21 +797,12 @@ public class YoloDetector {
             float w = maxX - minX + 1;
             float h = maxY - minY + 1;
             float aspect = w / h;
-            // Mein Ring ist nie ganz am Bildrand (rechts stehen grüne Würfel/Deko). Ausnahme: Busch-Suche nahe meiner letzten Position
-            if (!red && !weak) {
+            // Mein Ring ist nie ganz am Bildrand (rechts stehen grüne Würfel/Deko)
+            if (!red) {
                 float cxRel = (minX + maxX) * 0.5f / width;
                 if (cxRel < GREEN_CENTER_X_MIN || cxRel > GREEN_CENTER_X_MAX) {
                     continue;
                 }
-            }
-            if (weak) {
-                // Im Busch ist oft nur der untere Bogen des Rings sichtbar: flacher erlaubt, nicht hohl nötig
-                if (count < RING_MIN_PIXELS || w < minW || w > width * 0.08f || h < height * 0.025f
-                        || aspect < RING_MIN_ASPECT || aspect > 6f) {
-                    continue;
-                }
-                rings.add(new Ring(new RectF(minX, minY, maxX + 1, maxY + 1), count));
-                continue;
             }
             if (count < RING_MIN_PIXELS || w < minW || w > maxW || h < minH
                     || aspect < RING_MIN_ASPECT || aspect > RING_MAX_ASPECT) {
@@ -828,78 +826,331 @@ public class YoloDetector {
         return rings;
     }
 
-    // Wählt aus allen grünen Ringen meinen aus (bevorzugt nahe der letzten Position und der Bildmitte)
-    private RectF findMeRing(int width, int height, int pixelStride, int rowStride, int limit, long nowMs) {
-        weakWindow = null;
-        boolean hasLast = lastRingCx >= 0f && nowMs - lastRingTime <= RING_KEEP_MS;
-        RectF best = pickMeRing(findRings(false, width, height, pixelStride, rowStride, limit),
-                false, hasLast, width, height);
+    // ===================== MICH FINDEN =====================
 
-        // Liegt der beste Ring NICHT dort, wo ich eben noch war (oder gibt es keinen)?
-        // Dann nahe meiner letzten Position mit blasserem Grün suchen (so sieht mein Ring im Busch aus).
-        // So springt die grüne Box nicht auf einen Busch/Fleck woanders, nur weil mein Ring kurz blass ist.
-        boolean recent = lastRingCx >= 0f && lastGoodRingW > 0f && nowMs - lastRingTime <= RING_WEAK_MS;
-        boolean bestIsNear = best != null
-                && Math.hypot(best.centerX() - lastRingCx, best.centerY() - lastRingCy) < lastGoodRingW * 1.5f;
-        boolean weakUsed = false;
-        int normalPixels = lastRingPixels;
-        if (recent && !bestIsNear) {
-            float r = lastGoodRingW * 1.6f;
-            weakWindow = new RectF(lastRingCx - r, lastRingCy - r, lastRingCx + r, lastRingCy + r);
-            RectF weakBest = pickMeRing(findRings(false, width, height, pixelStride, rowStride, limit),
-                    true, true, width, height);
-            weakWindow = null;
-            if (weakBest != null) {
-                // Im Busch ist der Fleck oft breiter/schmaler als der Ring: meine normale Ringgröße nehmen
-                float w = lastGoodRingW;
-                float cx = weakBest.centerX();
-                best = new RectF(cx - w * 0.5f, weakBest.bottom - w * 0.75f, cx + w * 0.5f, weakBest.bottom);
-                weakUsed = true;
-            } else {
-                // Nichts Blasses in meiner Nähe: dann gilt der normal gefundene Ring (falls es einen gibt)
-                lastRingPixels = normalPixels;
+    // Prüfpunkte einer Ellipse (als Abstand im Bildpuffer), für eine bestimmte Ringgröße
+    private static class Ell {
+        int[] band;   // auf dem grünen Ringband
+        int[] inner;  // innen (dort steht die Figur, muss NICHT grün sein)
+        int[] outer;  // knapp außerhalb (muss NICHT grün sein, sonst ist es eine grüne Fläche)
+        int mx;       // so weit reicht die Ellipse nach links/rechts
+        int my;       // so weit reicht die Ellipse nach oben/unten
+    }
+
+    private static Ell buildEll(float w, int width) {
+        float rx = w * 0.5f;
+        float ry = w / RING_ASPECT * 0.5f;
+        Ell e = new Ell();
+        e.band = ellipsePoints(rx, ry, new float[]{0.78f, 0.90f}, 40, width);
+        e.inner = ellipsePoints(rx, ry, new float[]{0f, 0.3f, 0.5f}, 16, width);
+        e.outer = ellipsePoints(rx, ry, new float[]{1.3f}, 32, width);
+        e.mx = (int) Math.ceil(rx * 1.3f) + 1;
+        e.my = (int) Math.ceil(ry * 1.3f) + 1;
+        return e;
+    }
+
+    private static int[] ellipsePoints(float rx, float ry, float[] factors, int n, int width) {
+        java.util.LinkedHashSet<Integer> set = new java.util.LinkedHashSet<>();
+        for (float f : factors) {
+            for (int k = 0; k < n; k++) {
+                double t = 2.0 * Math.PI * k / n;
+                int dx = Math.round((float) (f * rx * Math.cos(t)));
+                int dy = Math.round((float) (f * ry * Math.sin(t)));
+                set.add(dy * width + dx);
             }
         }
+        int[] out = new int[set.size()];
+        int i = 0;
+        for (Integer v : set) {
+            out[i++] = v;
+        }
+        return out;
+    }
 
-        if (best != null) {
-            if (!weakUsed) {
-                lastGoodRingW = lastGoodRingW <= 0f ? best.width() : lastGoodRingW * 0.8f + best.width() * 0.2f;
-                // Nur ein ECHTER Ring-Treffer verlängert die Busch-Suche. Sonst könnte sich die Busch-Suche
-                // an etwas Falschem (z. B. den eigenen grünen Overlay-Ecken) endlos festhalten.
-                lastRingTime = nowMs;
+    // Ellipse für die gelernte Ringgröße (wird nur neu gebaut, wenn sich die Größe ändert)
+    private Ell ellFor(int width) {
+        if (ellOffsets == null || Math.abs(ellForW - ringW) > 0.01f || ellForWidth != width) {
+            ellCache = buildEll(ringW, width);
+            ellOffsets = new int[0][];
+            ellForW = ringW;
+            ellForWidth = width;
+        }
+        return ellCache;
+    }
+
+    private Ell ellCache = null;
+    private float bootW = 0f;           // beim ersten Lernen gemessene Größe (Grenze für spätere Änderungen)
+    private int[] greenSum = new int[0]; // Summen-Tabelle der grünen Pixel (zum schnellen Überspringen)
+
+    // Markiert alle hellgrünen Ring-Pixel im Suchbereich und baut die Summen-Tabelle
+    private void buildGreenMask(int width, int height, int pixelStride, int rowStride, int limit) {
+        int n = width * height;
+        if (greenMask.length != n) {
+            greenMask = new byte[n];
+        }
+        int x0 = (int) (width * 0.03f);
+        int x1 = (int) (width * 0.97f);
+        int y0 = (int) (height * RING_Y_MIN);
+        int y1 = (int) (height * RING_Y_MAX);
+        int uiX = (int) (width * UI_X);
+        int uiY = (int) (height * UI_Y);
+        for (int y = y0; y < y1; y++) {
+            int rowStart = y * rowStride;
+            int base = y * width;
+            for (int x = x0; x < x1; x++) {
+                byte m = 0;
+                if (!(x > uiX && y > uiY)) {
+                    int idx = rowStart + x * pixelStride;
+                    if (idx + 2 < limit && isRingGreen(frameBytes[idx] & 0xFF,
+                            frameBytes[idx + 1] & 0xFF, frameBytes[idx + 2] & 0xFF)) {
+                        m = 1;
+                    }
+                }
+                greenMask[base + x] = m;
             }
-            lastRingCx = best.centerX();
-            lastRingCy = best.centerY();
+        }
+        // Summen-Tabelle: Anzahl grüner Pixel im Rechteck (0,0)-(x,y)
+        int sw = width + 1;
+        if (greenSum.length != sw * (height + 1)) {
+            greenSum = new int[sw * (height + 1)];
+        }
+        for (int y = 0; y < height; y++) {
+            int rowSum = 0;
+            int base = y * width;
+            int s = (y + 1) * sw;
+            for (int x = 0; x < width; x++) {
+                rowSum += greenMask[base + x];
+                greenSum[s + x + 1] = greenSum[s - sw + x + 1] + rowSum;
+            }
+        }
+    }
+
+    private int greenCount(int x0, int y0, int x1, int y1, int width) {
+        int sw = width + 1;
+        return greenSum[(y1 + 1) * sw + x1 + 1] - greenSum[y0 * sw + x1 + 1]
+                - greenSum[(y1 + 1) * sw + x0] + greenSum[y0 * sw + x0];
+    }
+
+    // Wie gut passt die Ellipse an dieser Stelle? (Ringband grün, innen und außen nicht)
+    private float ellScore(Ell e, int c) {
+        int b = 0;
+        for (int d : e.band) {
+            if (greenMask[c + d] != 0) {
+                b++;
+            }
+        }
+        float bs = (float) b / e.band.length;
+        if (bs < 0.25f) {
+            return -99f;
+        }
+        int in = 0;
+        for (int d : e.inner) {
+            if (greenMask[c + d] != 0) {
+                in++;
+            }
+        }
+        int out = 0;
+        for (int d : e.outer) {
+            if (greenMask[c + d] != 0) {
+                out++;
+            }
+        }
+        return bs - 0.6f * in / e.inner.length - 0.6f * out / e.outer.length;
+    }
+
+    // Sucht die beste Stelle für die Ellipse in einem Rechteck. Liefert {x, y, Wert} oder null.
+    // distPenalty > 0: Stellen weit weg von (px, py) werden abgewertet.
+    private float[] searchEllipse(Ell e, int x0, int y0, int x1, int y1, int step, int width, int height,
+                                  float px, float py, float distPenalty) {
+        x0 = Math.max(x0, e.mx);
+        y0 = Math.max(y0, e.my);
+        x1 = Math.min(x1, width - 1 - e.mx);
+        y1 = Math.min(y1, height - 1 - e.my);
+        int uiX = (int) (width * UI_X);
+        int uiY = (int) (height * UI_Y);
+        int need = (int) (e.band.length * 0.25f);
+        float bestVal = -99f;
+        float[] best = null;
+        for (int y = y0; y <= y1; y += step) {
+            for (int x = x0; x <= x1; x += step) {
+                if (x > uiX && y > uiY) {
+                    continue;
+                }
+                // Zu wenig Grün in der Umgebung -> kann kein Ring sein (spart viel Rechenzeit)
+                if (greenCount(x - e.mx, y - e.my, x + e.mx, y + e.my, width) < need) {
+                    continue;
+                }
+                float s = ellScore(e, y * width + x);
+                if (s < -50f) {
+                    continue;
+                }
+                float v = s;
+                if (distPenalty > 0f) {
+                    v -= distPenalty * (float) Math.hypot(x - px, y - py);
+                }
+                if (v > bestVal) {
+                    bestVal = v;
+                    best = new float[]{x, y, s};
+                }
+            }
         }
         return best;
     }
 
-    // Wählt aus den gefundenen grünen Ringen meinen aus
-    private RectF pickMeRing(List<Ring> rings, boolean weakMode, boolean hasLast, int width, int height) {
+    private float medianSize() {
+        List<Float> sorted = new ArrayList<>(sizeHistory);
+        Collections.sort(sorted);
+        return sorted.get(sorted.size() / 2);
+    }
+
+    // Prüft an der gefundenen Stelle, ob der Ring etwas kleiner oder größer besser passt.
+    // Die Größe ist der Mittelwert (Median) vieler Messungen und ändert sich daher kaum.
+    private void updateSize(float[] best, int width, int height) {
+        float bestF = 1f;
+        float bestS = -99f;
+        float[] factors = {0.94f, 1f, 1.06f};
+        for (float f : factors) {
+            Ell e = f == 1f ? ellFor(width) : buildEll(ringW * f, width);
+            float[] r = searchEllipse(e, (int) best[0] - 1, (int) best[1] - 1,
+                    (int) best[0] + 1, (int) best[1] + 1, 1, width, height, 0f, 0f, 0f);
+            if (r != null && r[2] > bestS) {
+                bestS = r[2];
+                bestF = f;
+            }
+        }
+        sizeHistory.add(ringW * bestF);
+        if (sizeHistory.size() > SIZE_HISTORY) {
+            sizeHistory.remove(0);
+        }
+        // Nie weit von der zuerst gelernten Größe weglaufen
+        ringW = Math.max(bootW * 0.85f, Math.min(bootW * 1.2f, medianSize()));
+    }
+
+    // Größe noch unbekannt: Ring wie bisher über zusammenhängende Flecken finden
+    // und dabei die Größe lernen (erst nach mehreren guten Messungen)
+    private RectF bootstrapRing(int width, int height, int pixelStride, int rowStride, int limit, long nowMs) {
+        boolean hasLast = lastRingCx >= 0f && nowMs - lastRingTime <= RING_KEEP_MS;
+        RectF comp = pickMeRing(findRings(false, width, height, pixelStride, rowStride, limit),
+                hasLast, width, height);
+        lastRingScore = 0f;
+        if (comp == null) {
+            return null;
+        }
+        lastGoodRingW = lastGoodRingW <= 0f ? comp.width() : lastGoodRingW * 0.8f + comp.width() * 0.2f;
+        lastRingCx = comp.centerX();
+        lastRingCy = comp.centerY();
+        lastRingTime = nowMs;
+
+        buildGreenMask(width, height, pixelStride, rowStride, limit);
+        float bestW = 0f;
+        float bestS = -99f;
+        int r = Math.max(3, (int) (comp.width() * 0.3f));
+        for (int i = 0; i <= 8; i++) {
+            float w = comp.width() * (0.85f + 0.05f * i);
+            Ell e = buildEll(w, width);
+            float[] res = searchEllipse(e, (int) comp.centerX() - r, (int) comp.centerY() - r,
+                    (int) comp.centerX() + r, (int) comp.centerY() + r, 1, width, height, 0f, 0f, 0f);
+            if (res != null && res[2] > bestS) {
+                bestS = res[2];
+                bestW = w;
+            }
+        }
+        lastRingScore = Math.max(0f, bestS);
+        if (bestS >= RING_SCORE_BOOT) {
+            sizeHistory.add(bestW);
+            lastMatchTime = nowMs;
+            if (sizeHistory.size() >= BOOT_SAMPLES) {
+                ringW = medianSize();
+                bootW = ringW;
+            }
+        }
+        return comp;
+    }
+
+    // Findet meinen Ring. Liefert die Ring-Umrandung (Bildpixel) oder null.
+    private RectF findMeRing(int width, int height, int pixelStride, int rowStride, int limit, long nowMs) {
+        frameCounter++;
+        // Lange nichts gefunden (neue Runde, andere Karte): Größe neu lernen
+        if (ringW > 0f && nowMs - lastMatchTime > RING_RESET_MS) {
+            ringW = 0f;
+            bootW = 0f;
+            sizeHistory.clear();
+            ellOffsets = null;
+            lastGoodRingW = 0f;
+        }
+        if (ringW <= 0f) {
+            return bootstrapRing(width, height, pixelStride, rowStride, limit, nowMs);
+        }
+
+        buildGreenMask(width, height, pixelStride, rowStride, limit);
+        Ell e = ellFor(width);
+
+        // 1) Zuerst nahe meiner letzten Position suchen (kleines Fenster, so weit bewegt man sich kaum).
+        //    Mein Lebensbalken liegt weiter oben und damit außerhalb des Fensters.
+        float[] best = null;
+        boolean recent = lastRingCx >= 0f && nowMs - lastMatchTime <= RING_LOCAL_MS;
+        if (recent) {
+            int r = (int) Math.max(8f, ringW * 0.5f);
+            float[] local = searchEllipse(e, (int) lastRingCx - r, (int) lastRingCy - r,
+                    (int) lastRingCx + r, (int) lastRingCy + r, 1, width, height,
+                    lastRingCx, lastRingCy, 0.25f / ringW);
+            if (local != null && local[2] >= RING_SCORE_LOCAL) {
+                best = local;
+            }
+        }
+
+        // 2) Nichts gefunden (oder jedes 4. Bild zur Kontrolle): im ganzen Bild suchen, aber strenger
+        if (best == null || frameCounter % GLOBAL_CHECK_EVERY == 0) {
+            int step = best == null ? 2 : 3;
+            float[] global = searchEllipse(e, (int) (width * RING_X_MIN), (int) (height * RING_Y_MIN),
+                    (int) (width * RING_X_MAX), (int) (height * RING_Y_MAX), step, width, height, 0f, 0f, 0f);
+            if (global != null) {
+                // fein nachsuchen
+                global = searchEllipse(e, (int) global[0] - step, (int) global[1] - step,
+                        (int) global[0] + step, (int) global[1] + step, 1, width, height, 0f, 0f, 0f);
+            }
+            if (global != null && global[2] >= RING_SCORE_GLOBAL) {
+                if (best == null) {
+                    best = global;
+                } else if (Math.hypot(global[0] - best[0], global[1] - best[1]) > ringW
+                        && global[2] > best[2] + 0.2f) {
+                    // Woanders passt es VIEL besser: die lokale Suche hing an etwas Falschem
+                    best = global;
+                }
+            }
+        }
+
+        if (best == null) {
+            lastRingScore = 0f;
+            return null;
+        }
+        lastRingScore = best[2];
+        if (best[2] >= RING_SCORE_SIZE) {
+            updateSize(best, width, height);
+        }
+        lastRingCx = best[0];
+        lastRingCy = best[1];
+        lastMatchTime = nowMs;
+        lastRingTime = nowMs;
+        float w = ringW * RING_BOX_SCALE;
+        float h = w / RING_ASPECT;
+        return new RectF(best[0] - w * 0.5f, best[1] - h * 0.5f, best[0] + w * 0.5f, best[1] + h * 0.5f);
+    }
+
+    // Wählt aus den gefundenen grünen Flecken meinen Ring aus (nur fürs erste Lernen der Größe)
+    private RectF pickMeRing(List<Ring> rings, boolean hasLast, int width, int height) {
         RectF best = null;
         float bestScore = 0f;
-        int bestPixels = 0;
         for (Ring ring : rings) {
-            // Nur ein Teil des Rings sichtbar (Explosion, Effekt)? Dann lieber nicht nehmen,
-            // die letzte Position bleibt im Overlay kurz stehen.
+            // Nur ein Teil des Rings sichtbar (Explosion, Effekt)? Dann lieber nicht nehmen
             if (lastGoodRingW > 0f && ring.box.width() < lastGoodRingW * 0.75f) {
-                continue;
-            }
-            // Im Busch-Modus muss der Ring ungefähr meine normale Größe haben
-            if (weakMode && ring.box.width() > lastGoodRingW * 1.4f) {
-                continue;
-            }
-            // Im Busch-Modus muss der Ring auf meiner Höhe liegen (mein grüner Lebensbalken ist weiter oben)
-            // und darf sich nur wenig bewegt haben (sonst ist es ein anderer grüner Fleck, z. B. Spielfeld)
-            if (weakMode && (Math.abs(ring.box.centerY() - lastRingCy) > lastGoodRingW * 0.6f
-                    || Math.abs(ring.box.centerX() - lastRingCx) > lastGoodRingW * 0.8f)) {
                 continue;
             }
             float cx = ring.box.centerX();
             float cy = ring.box.centerY();
             boolean nearLast = hasLast && Math.hypot(cx - lastRingCx, cy - lastRingCy) < ring.box.width();
-            // Große Ringe (z. B. Fußball-Karte, Kamera näher dran) nur dort, wo ich eben noch war
-            if (!weakMode && !nearLast && ring.box.width() > width * RING_MAX_W_NEW) {
+            // Große Ringe nur dort, wo ich eben noch war
+            if (!nearLast && ring.box.width() > width * RING_MAX_W_NEW) {
                 continue;
             }
             float score = ring.pixels;
@@ -911,12 +1162,22 @@ public class YoloDetector {
             score *= 1.5f - Math.min(1f, (float) Math.hypot(dxc, dyc));
             if (score > bestScore) {
                 bestScore = score;
-                bestPixels = ring.pixels;
                 best = ring.box;
             }
         }
-        lastRingPixels = bestPixels;
         return best;
+    }
+
+    // Gegner-Box auf die feste Ringgröße bringen: Mitte und Fußhöhe kommen von der KI bzw. dem roten Ring,
+    // Breite und Höhe vom gelernten Ring. So haben alle Boxen immer dieselbe ruhige Größe.
+    private RectF normalizeBox(RectF b, float scaleX, float scaleY) {
+        if (ringW <= 0f) {
+            return b;
+        }
+        float w = ringW * RING_BOX_SCALE * scaleX;
+        float h = ringW * RING_BOX_SCALE * ME_BOX_HEIGHT * scaleY;
+        float cx = b.centerX();
+        return new RectF(cx - w * 0.5f, Math.max(0f, b.bottom - h), cx + w * 0.5f, b.bottom);
     }
 
     // Baut aus einem Ring (Bildpixel) die Box der Figur darüber (Bildschirmpixel)
