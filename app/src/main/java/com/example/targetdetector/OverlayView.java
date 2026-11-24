@@ -13,7 +13,7 @@ import java.util.List;
 
 public class OverlayView extends View {
 
-    private static final int COLOR_PLAYER = Color.rgb(155, 255, 155);
+    private static final int COLOR_PLAYER = Color.rgb(120, 255, 120);  // grün = ich
     private static final int COLOR_TEAMMATE = Color.rgb(155, 190, 255);
     private static final int COLOR_ENEMY = Color.rgb(255, 110, 110);
     private static final int COLOR_AIM_LINE = Color.rgb(255, 190, 40); // gelb-orange
@@ -31,13 +31,23 @@ public class OverlayView extends View {
     // Durchsichtigkeit der Ecken (0 = unsichtbar, 255 = voll sichtbar)
     private static final int CORNER_ALPHA = 245;
 
-    // Zielpunkt bei 65 % der Boxhöhe von oben (Körper statt Name/Lebensbalken)
+    // Linienstart: Mitte meiner grünen Box (0.5 = genau die Mitte, größer = tiefer)
+    private static final float ME_AIM_Y_FACTOR = 0.5f;
+    // Linienziel: 65 % der Gegner-Boxhöhe von oben (Körper statt Name/Lebensbalken)
     private static final float AIM_Y_FACTOR = 0.65f;
-    // Wird "Ich" von der KI mal nicht erkannt, bleibt die letzte Position so lange als Linienstart gültig
+    // Wird "ich" kurz nicht erkannt, bleibt die letzte Position so lange gültig
     private static final long ME_HOLD_MS = 600;
+
     // Ziellinie: dünn und leicht durchsichtig, damit die KI sie kaum sieht
     private static final float AIM_LINE_WIDTH = 3f;
     private static final int AIM_LINE_ALPHA = 170;
+    // Neuer Gegner wird erst Ziel, wenn er mindestens 20 % näher ist als das alte Ziel
+    private static final float TARGET_SWITCH_RATIO = 0.8f;
+    // Linienenden: unter 6 px Bewegung bleiben sie stehen, über 120 px springen sie sofort
+    private static final float LINE_DEADZONE_PX = 6f;
+    private static final float LINE_SNAP_PX = 120f;
+    // Dazwischen leichte Glättung (1.0 = keine Glättung, kleiner = ruhiger aber träger)
+    private static final float LINE_FOLLOW = 0.6f;
 
     private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint linePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
@@ -45,8 +55,16 @@ public class OverlayView extends View {
     private List<ColorDetector.Detection> detections = new ArrayList<>();
     private String debugText = "Starte...";
     private long lastHitTime = 0;
+
+    // Meine letzte bekannte Position
     private RectF meBox = null;
     private long meTime = 0;
+
+    // Zustand der Ziellinie
+    private boolean hasLine = false;
+    private float lineStartX, lineStartY, lineEndX, lineEndY;
+    private float targetCx, targetCy;
+    private boolean hasTarget = false;
 
     public OverlayView(Context context) {
         super(context);
@@ -72,7 +90,7 @@ public class OverlayView extends View {
             debugText = status;
             long now = SystemClock.uptimeMillis();
 
-            // "Ich" getrennt von den Gegnern behandeln, damit die Linie nicht abreißt
+            // "Ich" getrennt von den Gegnern behandeln
             List<ColorDetector.Detection> others = new ArrayList<>();
             RectF freshMe = null;
             for (ColorDetector.Detection d : filtered) {
@@ -82,10 +100,6 @@ public class OverlayView extends View {
                     others.add(d);
                 }
             }
-            // Sicherheitsnetz: liegt "Ich" auf einem Gegner, ist es keine echte Position von mir
-            if (freshMe != null && !overlapsEnemy(freshMe, others)) {
-                updateMe(freshMe, now);
-            }
 
             if (!others.isEmpty()) {
                 // Neue Boxen sofort übernehmen, nur Mini-Schwankungen werden geschluckt
@@ -94,8 +108,28 @@ public class OverlayView extends View {
             } else if (now - lastHitTime > HOLD_MS) {
                 detections = others;
             }
+
+            // Sicherheitsnetz: liegt "ich" auf einem Gegner, ist es keine echte Position von mir
+            if (freshMe != null && !overlapsEnemy(freshMe, detections)) {
+                updateMe(freshMe, now);
+            }
+
+            updateLine(now);
             invalidate();
         });
+    }
+
+    // "Ich" kann je nach YoloDetector-Version als ME oder PLAYER kommen
+    private static boolean isMe(ColorDetector.TargetType type) {
+        return type == ColorDetector.TargetType.ME || type == ColorDetector.TargetType.PLAYER;
+    }
+
+    private static boolean sameKind(ColorDetector.TargetType a, ColorDetector.TargetType b) {
+        return a == b || (isMe(a) && isMe(b));
+    }
+
+    private boolean meValid(long now) {
+        return meBox != null && now - meTime <= ME_HOLD_MS;
     }
 
     private static boolean overlapsEnemy(RectF me, List<ColorDetector.Detection> list) {
@@ -113,22 +147,122 @@ public class OverlayView extends View {
     }
 
     private void updateMe(RectF fresh, long now) {
-        if (meBox != null && Math.hypot(fresh.centerX() - meBox.centerX(),
-                fresh.centerY() - meBox.centerY()) < CENTER_DEADZONE_PX) {
-            // Mini-Schwankung: alte Position behalten
-        } else {
+        if (meBox == null) {
             meBox = new RectF(fresh);
+        } else {
+            // Gleiche Ruhe-Regeln wie bei den Gegnern: Mini-Zittern und Mini-Größenänderung ignorieren
+            float cx = fresh.centerX();
+            float cy = fresh.centerY();
+            if (Math.hypot(cx - meBox.centerX(), cy - meBox.centerY()) < CENTER_DEADZONE_PX) {
+                cx = meBox.centerX();
+                cy = meBox.centerY();
+            }
+            float w = fresh.width();
+            float h = fresh.height();
+            if (meBox.width() > 0f && Math.abs(w - meBox.width()) / meBox.width() < SIZE_TOLERANCE) {
+                w = meBox.width();
+            }
+            if (meBox.height() > 0f && Math.abs(h - meBox.height()) / meBox.height() < SIZE_TOLERANCE) {
+                h = meBox.height();
+            }
+            meBox = new RectF(cx - w / 2f, cy - h / 2f, cx + w / 2f, cy + h / 2f);
         }
         meTime = now;
     }
 
-    // "Ich" kann je nach YoloDetector-Version als ME oder PLAYER kommen
-    private static boolean isMe(ColorDetector.TargetType type) {
-        return type == ColorDetector.TargetType.ME || type == ColorDetector.TargetType.PLAYER;
+    // Wählt das Ziel (mit Wechsel-Puffer) und bewegt die Linienenden ruhig nach
+    private void updateLine(long now) {
+        if (!meValid(now)) {
+            hasLine = false;
+            hasTarget = false;
+            return;
+        }
+
+        float sx = meBox.centerX();
+        float sy = meBox.top + meBox.height() * ME_AIM_Y_FACTOR;
+
+        RectF nearest = null;
+        float nearestDist = Float.MAX_VALUE;
+        RectF current = null;
+        float currentDist = Float.MAX_VALUE;
+        float currentMove = Float.MAX_VALUE;
+
+        for (ColorDetector.Detection d : detections) {
+            if (d.type != ColorDetector.TargetType.ENEMY) {
+                continue;
+            }
+            float dist = (float) Math.hypot(d.box.centerX() - sx, aimY(d.box) - sy);
+            if (dist < nearestDist) {
+                nearestDist = dist;
+                nearest = d.box;
+            }
+            // Ist das hier noch derselbe Gegner wie beim letzten Mal?
+            if (hasTarget) {
+                float move = (float) Math.hypot(d.box.centerX() - targetCx, d.box.centerY() - targetCy);
+                float gate = Math.max(d.box.width(), d.box.height()) * 0.8f;
+                if (move < gate && move < currentMove) {
+                    currentMove = move;
+                    current = d.box;
+                    currentDist = dist;
+                }
+            }
+        }
+
+        if (nearest == null) {
+            hasLine = false;
+            hasTarget = false;
+            return;
+        }
+
+        // Beim alten Ziel bleiben, solange der neue Gegner nicht deutlich näher ist
+        RectF target = nearest;
+        if (current != null && current != nearest && nearestDist > currentDist * TARGET_SWITCH_RATIO) {
+            target = current;
+        }
+        boolean targetChanged = !hasTarget || target != current;
+        targetCx = target.centerX();
+        targetCy = target.centerY();
+        hasTarget = true;
+
+        float ex = target.centerX();
+        float ey = aimY(target);
+
+        if (!hasLine) {
+            lineStartX = sx;
+            lineStartY = sy;
+            lineEndX = ex;
+            lineEndY = ey;
+            hasLine = true;
+            return;
+        }
+
+        float[] s = smooth(lineStartX, lineStartY, sx, sy);
+        lineStartX = s[0];
+        lineStartY = s[1];
+
+        if (targetChanged) {
+            // Neues Ziel: Linienende springt sofort, statt langsam rüberzugleiten
+            lineEndX = ex;
+            lineEndY = ey;
+        } else {
+            float[] e = smooth(lineEndX, lineEndY, ex, ey);
+            lineEndX = e[0];
+            lineEndY = e[1];
+        }
     }
 
-    private static boolean sameKind(ColorDetector.TargetType a, ColorDetector.TargetType b) {
-        return a == b || (isMe(a) && isMe(b));
+    private static float[] smooth(float oldX, float oldY, float newX, float newY) {
+        float d = (float) Math.hypot(newX - oldX, newY - oldY);
+        if (d < LINE_DEADZONE_PX) {
+            return new float[]{oldX, oldY};
+        }
+        if (d > LINE_SNAP_PX) {
+            return new float[]{newX, newY};
+        }
+        return new float[]{
+                oldX + (newX - oldX) * LINE_FOLLOW,
+                oldY + (newY - oldY) * LINE_FOLLOW
+        };
     }
 
     // Vergleicht jede neue Box mit der passenden Box vom letzten Mal.
@@ -146,7 +280,6 @@ public class OverlayView extends View {
             float dw = d.box.width();
             float dh = d.box.height();
 
-            // Passende alte Box suchen (gleiche Art, Mitte nah genug)
             int best = -1;
             float bestDist = Float.MAX_VALUE;
             for (int i = 0; i < previous.size(); i++) {
@@ -193,7 +326,6 @@ public class OverlayView extends View {
 
     // Die KI liefert die sicherste Box zuerst. Jede weitere Box derselben Art, die stark
     // mit einer schon behaltenen überlappt oder deren Mitte darin liegt, wird verworfen.
-    // Ich und Gegner werden getrennt behandelt, damit sie sich im Nahkampf nicht gegenseitig löschen.
     private List<ColorDetector.Detection> removeDuplicates(List<ColorDetector.Detection> list) {
         List<ColorDetector.Detection> result = new ArrayList<>();
         for (ColorDetector.Detection d : list) {
@@ -228,16 +360,12 @@ public class OverlayView extends View {
     private void drawCorners(Canvas canvas, RectF b) {
         float len = Math.min(b.width(), b.height()) * CORNER_RATIO;
 
-        // oben links
         canvas.drawLine(b.left, b.top, b.left + len, b.top, paint);
         canvas.drawLine(b.left, b.top, b.left, b.top + len, paint);
-        // oben rechts
         canvas.drawLine(b.right, b.top, b.right - len, b.top, paint);
         canvas.drawLine(b.right, b.top, b.right, b.top + len, paint);
-        // unten links
         canvas.drawLine(b.left, b.bottom, b.left + len, b.bottom, paint);
         canvas.drawLine(b.left, b.bottom, b.left, b.bottom - len, paint);
-        // unten rechts
         canvas.drawLine(b.right, b.bottom, b.right - len, b.bottom, paint);
         canvas.drawLine(b.right, b.bottom, b.right, b.bottom - len, paint);
     }
@@ -254,6 +382,7 @@ public class OverlayView extends View {
             canvas.drawText(debugText, 40f, 100f, textPaint);
         }
 
+        // Gegner (rot) und Teamkameraden (blau)
         for (ColorDetector.Detection detection : detections) {
             if (detection.type == ColorDetector.TargetType.TEAMMATE) {
                 paint.setColor(COLOR_TEAMMATE);
@@ -264,28 +393,18 @@ public class OverlayView extends View {
             drawCorners(canvas, detection.box);
         }
 
-        // Ziellinie von mir zum nächstgelegenen Gegner (um mich selbst wird keine Box gezeichnet)
-        if (meBox != null && SystemClock.uptimeMillis() - meTime <= ME_HOLD_MS) {
-            float meX = meBox.centerX();
-            float meY = aimY(meBox);
+        long now = SystemClock.uptimeMillis();
 
-            RectF nearest = null;
-            float nearestDist = Float.MAX_VALUE;
-            for (ColorDetector.Detection detection : detections) {
-                if (detection.type != ColorDetector.TargetType.ENEMY) {
-                    continue;
-                }
-                float dist = (float) Math.hypot(detection.box.centerX() - meX,
-                        aimY(detection.box) - meY);
-                if (dist < nearestDist) {
-                    nearestDist = dist;
-                    nearest = detection.box;
-                }
-            }
+        // Grüne Box um mich
+        if (meValid(now)) {
+            paint.setColor(COLOR_PLAYER);
+            paint.setAlpha(CORNER_ALPHA);
+            drawCorners(canvas, meBox);
+        }
 
-            if (nearest != null) {
-                canvas.drawLine(meX, meY, nearest.centerX(), aimY(nearest), linePaint);
-            }
+        // Ziellinie von mir zum gewählten Gegner
+        if (hasLine && meValid(now)) {
+            canvas.drawLine(lineStartX, lineStartY, lineEndX, lineEndY, linePaint);
         }
     }
 }
