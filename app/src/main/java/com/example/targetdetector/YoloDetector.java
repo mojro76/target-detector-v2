@@ -26,7 +26,9 @@ public class YoloDetector {
     private static final String TAG = "YoloDetector";
     private static final String MODEL_FILE = "best.tflite";
     private static final int TARGET_CLASS_ID = 1; // 1 = Enemy
-    private static final float CONFIDENCE_THRESHOLD = 0.25f;
+    private static final float CONFIDENCE_THRESHOLD = 0.25f; // neue Boxen brauchen mindestens diesen Wert
+    private static final float LOW_THRESHOLD = 0.12f;        // schon bekannte Boxen dürfen bis hierher fallen
+    private static final long KEEP_MS = 300;                 // so lange merkt sich die KI die letzten Boxen
     private static final float IOU_THRESHOLD = 0.45f;
     private static final float MAX_BOX_RATIO = 0.20f; // Max. 20 % der Bildschirmbreite/-höhe
     private static final float PAD_VALUE = 114f / 255f;
@@ -65,6 +67,10 @@ public class YoloDetector {
     private int coordMode = 0;
 
     private String lastDebug = "Init...";
+
+    // Letzte erkannte Boxen (gegen Aussetzer, wenn der Wert kurz einbricht)
+    private final List<RectF> lastBoxes = new ArrayList<>();
+    private long lastBoxesTime = 0;
 
     private static class Candidate {
         final RectF box;
@@ -337,25 +343,35 @@ public class YoloDetector {
         int enemyChannel = 4 + TARGET_CLASS_ID;
         float enemyMax = 0f;
 
+        long nowMs = tStart / 1_000_000;
+        if (nowMs - lastBoxesTime > KEEP_MS) {
+            lastBoxes.clear();
+        }
+
         for (int i = 0; i < numBoxes; i++) {
-            // Schnelltest: Enemy-Wert zuerst prüfen, die meisten Boxen fliegen hier raus
+            // Schnelltest: die meisten Boxen fliegen hier sofort raus
             float enemyScore = getOut(enemyChannel, i);
             if (enemyScore > enemyMax) {
                 enemyMax = enemyScore;
             }
-            if (enemyScore < CONFIDENCE_THRESHOLD) {
+            if (enemyScore < LOW_THRESHOLD) {
                 continue;
             }
+            boolean strong = enemyScore >= CONFIDENCE_THRESHOLD;
 
-            // Enemy muss die beste Klasse dieser Box sein
-            boolean isBest = true;
+            // Beste andere Klasse dieser Box bestimmen
+            float bestOther = 0f;
             for (int c = 4; c < numChannels; c++) {
-                if (c != enemyChannel && getOut(c, i) > enemyScore) {
-                    isBest = false;
-                    break;
+                if (c != enemyChannel) {
+                    float v = getOut(c, i);
+                    if (v > bestOther) {
+                        bestOther = v;
+                    }
                 }
             }
-            if (!isBest) {
+            // Neue Boxen: Enemy muss klar die beste Klasse sein.
+            // Schwache Boxen (schon bekannt): Enemy darf knapp hinter der besten Klasse liegen.
+            if (strong ? bestOther > enemyScore : bestOther > enemyScore * 1.25f) {
                 continue;
             }
 
@@ -388,7 +404,14 @@ public class YoloDetector {
                 continue;
             }
 
-            candidates.add(new Candidate(new RectF(left, top, right, bottom), enemyScore));
+            RectF box = new RectF(left, top, right, bottom);
+
+            // Schwache Boxen nur zulassen, wenn dort kurz vorher schon eine Box war
+            if (!strong && !nearPreviousBox(box)) {
+                continue;
+            }
+
+            candidates.add(new Candidate(box, enemyScore));
         }
 
         // Doppelte Boxen per NMS herausfiltern
@@ -408,6 +431,15 @@ public class YoloDetector {
             }
         }
 
+        // Boxen dieses Bildes für das nächste Bild merken (bei leerem Bild bleiben die alten kurz erhalten)
+        if (!kept.isEmpty()) {
+            lastBoxes.clear();
+            for (Candidate k : kept) {
+                lastBoxes.add(k.box);
+            }
+            lastBoxesTime = nowMs;
+        }
+
         long tEnd = System.nanoTime();
         lastDebug = String.format(
                 Locale.US,
@@ -421,6 +453,15 @@ public class YoloDetector {
         );
 
         return results;
+    }
+
+    private boolean nearPreviousBox(RectF box) {
+        for (RectF previous : lastBoxes) {
+            if (calculateIoU(box, previous) > 0.2f) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private float getOut(int channel, int boxIndex) {
