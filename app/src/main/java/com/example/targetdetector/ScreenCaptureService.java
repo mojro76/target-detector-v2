@@ -5,8 +5,11 @@ import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.Service;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.content.pm.ServiceInfo;
+import android.graphics.Color;
 import android.graphics.PixelFormat;
+import android.graphics.drawable.GradientDrawable;
 import android.hardware.display.DisplayManager;
 import android.hardware.display.VirtualDisplay;
 import android.media.Image;
@@ -17,8 +20,16 @@ import android.os.Build;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.IBinder;
+import android.os.Looper;
+import android.text.SpannableString;
+import android.text.Spanned;
+import android.text.style.ForegroundColorSpan;
 import android.util.DisplayMetrics;
+import android.util.TypedValue;
+import android.view.Gravity;
+import android.view.MotionEvent;
 import android.view.WindowManager;
+import android.widget.TextView;
 
 import java.nio.ByteBuffer;
 import java.util.Collections;
@@ -43,6 +54,22 @@ public class ScreenCaptureService extends Service {
     private OverlayView overlayView;
     private YoloDetector yoloDetector;
 
+    // ===== Aufnahme (zum Auswerten am PC) =====
+    private FrameRecorder recorder;
+    private TextView recButton;                    // kleiner, verschiebbarer Knopf im Spiel
+    private WindowManager.LayoutParams recParams;
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    // Aktualisiert jede Viertelsekunde den Countdown auf dem Knopf
+    private final Runnable recTicker = new Runnable() {
+        @Override
+        public void run() {
+            updateRecButton();
+            if (recorder != null && recorder.isRecording()) {
+                mainHandler.postDelayed(this, 250);
+            }
+        }
+    };
+
     private int screenWidth;
     private int screenHeight;
     private int captureWidth;
@@ -57,8 +84,17 @@ public class ScreenCaptureService extends Service {
         super.onCreate();
         windowManager = (WindowManager) getSystemService(WINDOW_SERVICE);
         yoloDetector = new YoloDetector(this);
+        recorder = new FrameRecorder(this);
+        recorder.setListener(rec -> {
+            mainHandler.removeCallbacks(recTicker);
+            mainHandler.post(recTicker);
+        });
         updateScreenMetrics();
         setupOverlay();
+        SharedPreferences prefs = getSharedPreferences(FrameRecorder.PREFS, MODE_PRIVATE);
+        if (prefs.getBoolean(FrameRecorder.KEY_BUTTON, true)) {
+            setupRecordButton();
+        }
     }
 
     private void updateScreenMetrics() {
@@ -96,6 +132,105 @@ public class ScreenCaptureService extends Service {
         }
 
         windowManager.addView(overlayView, params);
+    }
+
+    // Kleiner Knopf am linken Rand: antippen = Aufnahme starten/stoppen, ziehen = verschieben.
+    // Dunkel mit winzigem roten Punkt, damit die Ring-Suche ihn nicht für einen Ring hält.
+    private void setupRecordButton() {
+        recButton = new TextView(this);
+        recButton.setTextColor(Color.WHITE);
+        recButton.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        int pad = dp(8);
+        recButton.setPadding(dp(10), pad, dp(10), pad);
+        GradientDrawable bg = new GradientDrawable();
+        bg.setColor(Color.argb(170, 30, 30, 30));
+        bg.setCornerRadius(dp(16));
+        recButton.setBackground(bg);
+        updateRecButton();
+
+        int overlayType = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
+                ? WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+                : WindowManager.LayoutParams.TYPE_PHONE;
+        recParams = new WindowManager.LayoutParams(
+                WindowManager.LayoutParams.WRAP_CONTENT,
+                WindowManager.LayoutParams.WRAP_CONTENT,
+                overlayType,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                        | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+                        | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                PixelFormat.TRANSLUCENT
+        );
+        recParams.gravity = Gravity.TOP | Gravity.LEFT;
+        recParams.x = dp(4);
+        recParams.y = Math.round(Math.min(screenWidth, screenHeight) * 0.42f);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            recParams.layoutInDisplayCutoutMode =
+                    WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
+        }
+
+        final int touchSlop = dp(8);
+        recButton.setOnTouchListener(new android.view.View.OnTouchListener() {
+            private float downX;
+            private float downY;
+            private int startX;
+            private int startY;
+            private boolean dragging;
+
+            @Override
+            public boolean onTouch(android.view.View v, MotionEvent e) {
+                switch (e.getActionMasked()) {
+                    case MotionEvent.ACTION_DOWN:
+                        downX = e.getRawX();
+                        downY = e.getRawY();
+                        startX = recParams.x;
+                        startY = recParams.y;
+                        dragging = false;
+                        return true;
+                    case MotionEvent.ACTION_MOVE:
+                        float dx = e.getRawX() - downX;
+                        float dy = e.getRawY() - downY;
+                        if (!dragging && Math.hypot(dx, dy) > touchSlop) {
+                            dragging = true;
+                        }
+                        if (dragging && recButton != null) {
+                            recParams.x = startX + Math.round(dx);
+                            recParams.y = startY + Math.round(dy);
+                            windowManager.updateViewLayout(recButton, recParams);
+                        }
+                        return true;
+                    case MotionEvent.ACTION_UP:
+                        if (!dragging && recorder != null) {
+                            recorder.toggle();
+                        }
+                        return true;
+                    default:
+                        return false;
+                }
+            }
+        });
+
+        windowManager.addView(recButton, recParams);
+    }
+
+    // Text des Knopfs: "● REC" in Ruhe, "■ 12 s" während der Aufnahme
+    private void updateRecButton() {
+        if (recButton == null) {
+            return;
+        }
+        boolean rec = recorder != null && recorder.isRecording();
+        String text = rec ? "\u25A0 " + recorder.secondsLeft() + " s" : "\u25CF REC";
+        SpannableString span = new SpannableString(text);
+        span.setSpan(new ForegroundColorSpan(rec ? Color.WHITE : Color.rgb(255, 70, 70)),
+                0, 1, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+        recButton.setText(span);
+        GradientDrawable bg = (GradientDrawable) recButton.getBackground();
+        if (bg != null) {
+            bg.setColor(rec ? Color.argb(200, 150, 20, 20) : Color.argb(170, 30, 30, 30));
+        }
+    }
+
+    private int dp(float v) {
+        return Math.round(v * getResources().getDisplayMetrics().density);
     }
 
     @Override
@@ -228,6 +363,12 @@ public class ScreenCaptureService extends Service {
 
                 long ms = (System.nanoTime() - t0) / 1_000_000;
                 String debugInfo = yoloDetector != null ? yoloDetector.getLastDebug() : "Detector null";
+
+                // Läuft eine Aufnahme? Dann dieses Bild (mit Messwerten) im Hintergrund speichern
+                if (recorder != null && recorder.isRecording()) {
+                    recorder.addFrame(buffer, captureWidth, captureHeight, pixelStride, rowStride,
+                            detections, ms, debugInfo);
+                }
                 overlayView.updateDetections(
                         detections,
                         "KI: " + ms + " ms | Treffer: " + detections.size() + " | " + debugInfo
@@ -297,6 +438,15 @@ public class ScreenCaptureService extends Service {
 
     @Override
     public void onDestroy() {
+        // Laufende Aufnahme sauber abschließen (die ZIP-Datei wird im Hintergrund fertig geschrieben)
+        if (recorder != null) {
+            recorder.stop();
+        }
+        mainHandler.removeCallbacks(recTicker);
+        if (recButton != null && windowManager != null) {
+            windowManager.removeView(recButton);
+            recButton = null;
+        }
         cleanupCapture();
         if (yoloDetector != null) {
             yoloDetector.close();
@@ -317,4 +467,4 @@ public class ScreenCaptureService extends Service {
     public IBinder onBind(Intent intent) {
         return null;
     }
-        }
+}
