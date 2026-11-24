@@ -39,6 +39,12 @@ public class OverlayView extends View {
     private static final float AIM_Y_FACTOR = 0.65f;
     // Wird "ich" kurz nicht erkannt, bleibt die letzte Position so lange gültig
     private static final long ME_HOLD_MS = 600;
+    // Ich-Box vorausschieben (Messung: angezeigte Box zeigte die Position von vor ~115 ms).
+    // Nur beim Laufen (ab 70 px/s), höchstens 0,6 Boxbreiten, Tempo geglättet.
+    private static final float LEAD_MS = 115f;
+    private static final float VEL_SMOOTH = 0.3f;
+    private static final float MIN_SPEED = 0.07f;      // px pro ms
+    private static final float MAX_LEAD_RATIO = 0.6f;
 
     // Ziellinie: dünn und leicht durchsichtig, damit die KI sie kaum sieht
     private static final float AIM_LINE_WIDTH = 3f;
@@ -66,6 +72,11 @@ public class OverlayView extends View {
     // Meine letzte bekannte Position
     private RectF meBox = null;
     private long meTime = 0;
+    // Letzte echte (nicht vorausgeschobene) Position und geglättetes Tempo
+    private RectF meRaw = null;
+    private long meRawTime = 0;
+    private float meVx = 0f;
+    private float meVy = 0f;
 
     // Zustand der Ziellinie
     private boolean hasLine = false;
@@ -149,6 +160,30 @@ public class OverlayView extends View {
     }
 
     private void updateMe(RectF fresh, long now) {
+        float dt = now - meRawTime;
+        if (meRaw != null && dt > 0f && dt < 200f
+                && Math.hypot(fresh.centerX() - meRaw.centerX(), fresh.centerY() - meRaw.centerY()) <= fresh.width()) {
+            meVx = VEL_SMOOTH * (fresh.centerX() - meRaw.centerX()) / dt + (1f - VEL_SMOOTH) * meVx;
+            meVy = VEL_SMOOTH * (fresh.centerY() - meRaw.centerY()) / dt + (1f - VEL_SMOOTH) * meVy;
+        } else {
+            meVx = 0f;
+            meVy = 0f;
+        }
+        meRaw = fresh;
+        meRawTime = now;
+        if (Math.hypot(meVx, meVy) >= MIN_SPEED) {
+            float ox = meVx * LEAD_MS;
+            float oy = meVy * LEAD_MS;
+            float m = (float) Math.hypot(ox, oy);
+            float lim = MAX_LEAD_RATIO * fresh.width();
+            if (m > lim) {
+                ox *= lim / m;
+                oy *= lim / m;
+            }
+            fresh = new RectF(fresh);
+            fresh.offset(ox, oy);
+        }
+
         if (meBox == null) {
             meBox = new RectF(fresh);
         } else {
