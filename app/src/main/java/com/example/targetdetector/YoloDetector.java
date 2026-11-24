@@ -26,8 +26,10 @@ public class YoloDetector {
     private static final String TAG = "YoloDetector";
     private static final String MODEL_FILE = "best.tflite";
     private static final int TARGET_CLASS_ID = 1; // 1 = Enemy
-    private static final float CONFIDENCE_THRESHOLD = 0.25f; // neue Boxen brauchen mindestens diesen Wert
-    private static final float LOW_THRESHOLD = 0.12f;        // schon bekannte Boxen dürfen bis hierher fallen
+    private static final int ME_CLASS_ID = 5;     // 5 = Me
+    private static final float CONFIDENCE_THRESHOLD = 0.25f; // neue Enemy-Boxen brauchen mindestens diesen Wert
+    private static final float LOW_THRESHOLD = 0.12f;        // schon bekannte Enemy-Boxen dürfen bis hierher fallen
+    private static final float ME_CONFIDENCE_THRESHOLD = 0.25f;
     private static final long KEEP_MS = 300;                 // so lange merkt sich die KI die letzten Boxen
     private static final float IOU_THRESHOLD = 0.45f;
     private static final float MAX_BOX_RATIO = 0.20f; // Max. 20 % der Bildschirmbreite/-höhe
@@ -71,7 +73,7 @@ public class YoloDetector {
 
     private String lastDebug = "Init...";
 
-    // Letzte erkannte Boxen (gegen Aussetzer, wenn der Wert kurz einbricht)
+    // Letzte erkannte Enemy-Boxen (gegen Aussetzer, wenn der Wert kurz einbricht)
     private final List<RectF> lastBoxes = new ArrayList<>();
     private long lastBoxesTime = 0;
 
@@ -238,9 +240,10 @@ public class YoloDetector {
     ) {
         List<ColorDetector.Detection> results = new ArrayList<>();
         ensureInitialized();
+        int requiredChannel = 4 + Math.max(TARGET_CLASS_ID, ME_CLASS_ID);
         if (interpreter == null || outputBuffer == null || buffer == null
-                || width <= 0 || height <= 0 || numChannels <= 4 + TARGET_CLASS_ID) {
-            if (interpreter != null && numChannels <= 4 + TARGET_CLASS_ID) {
+                || width <= 0 || height <= 0 || numChannels <= requiredChannel) {
+            if (interpreter != null && numChannels <= requiredChannel) {
                 lastDebug = "Zu wenig Kanaele: " + numChannels;
             }
             return results;
@@ -359,7 +362,10 @@ public class YoloDetector {
         List<Candidate> candidates = new ArrayList<>();
 
         int enemyChannel = 4 + TARGET_CLASS_ID;
+        int meChannel = 4 + ME_CLASS_ID;
         float enemyMax = 0f;
+        RectF bestMeBox = null;
+        float bestMeScore = ME_CONFIDENCE_THRESHOLD;
 
         long nowMs = tStart / 1_000_000;
         if (nowMs - lastBoxesTime > KEEP_MS) {
@@ -372,67 +378,60 @@ public class YoloDetector {
             if (enemyScore > enemyMax) {
                 enemyMax = enemyScore;
             }
-            if (enemyScore < LOW_THRESHOLD) {
+            float meScore = getOut(meChannel, i);
+
+            boolean checkEnemy = enemyScore >= LOW_THRESHOLD;
+            boolean checkMe = meScore >= bestMeScore;
+            if (!checkEnemy && !checkMe) {
                 continue;
             }
-            boolean strong = enemyScore >= CONFIDENCE_THRESHOLD;
 
-            // Beste andere Klasse dieser Box bestimmen
-            float bestOther = 0f;
-            for (int c = 4; c < numChannels; c++) {
-                if (c != enemyChannel) {
-                    float v = getOut(c, i);
-                    if (v > bestOther) {
-                        bestOther = v;
+            RectF decodedBox = null;
+
+            if (checkEnemy) {
+                boolean strong = enemyScore >= CONFIDENCE_THRESHOLD;
+                float bestOther = 0f;
+                for (int c = 4; c < numChannels; c++) {
+                    if (c != enemyChannel) {
+                        float v = getOut(c, i);
+                        if (v > bestOther) {
+                            bestOther = v;
+                        }
+                    }
+                }
+                // Neue Boxen: Enemy muss klar die beste Klasse sein.
+                // Schwache Boxen (schon bekannt): Enemy darf knapp hinter der besten Klasse liegen.
+                if (!(strong ? bestOther > enemyScore : bestOther > enemyScore * 1.25f)) {
+                    decodedBox = decodeBox(i, normalized, scaleToOutX, scaleToOutY,
+                            outputWidth, outputHeight, maxBoxWidth, maxBoxHeight);
+                    if (decodedBox != null && (strong || nearPreviousBox(decodedBox))) {
+                        candidates.add(new Candidate(decodedBox, enemyScore));
                     }
                 }
             }
-            // Neue Boxen: Enemy muss klar die beste Klasse sein.
-            // Schwache Boxen (schon bekannt): Enemy darf knapp hinter der besten Klasse liegen.
-            if (strong ? bestOther > enemyScore : bestOther > enemyScore * 1.25f) {
-                continue;
+
+            if (checkMe) {
+                boolean meIsBest = true;
+                for (int c = 4; c < numChannels; c++) {
+                    if (c != meChannel && getOut(c, i) > meScore) {
+                        meIsBest = false;
+                        break;
+                    }
+                }
+                if (meIsBest) {
+                    if (decodedBox == null) {
+                        decodedBox = decodeBox(i, normalized, scaleToOutX, scaleToOutY,
+                                outputWidth, outputHeight, maxBoxWidth, maxBoxHeight);
+                    }
+                    if (decodedBox != null) {
+                        bestMeScore = meScore;
+                        bestMeBox = decodedBox;
+                    }
+                }
             }
-
-            float cx = getOut(0, i);
-            float cy = getOut(1, i);
-            float bw = getOut(2, i);
-            float bh = getOut(3, i);
-
-            if (normalized) {
-                cx *= inputWidth;
-                cy *= inputHeight;
-                bw *= inputWidth;
-                bh *= inputHeight;
-            }
-
-            float x1 = cx - bw * 0.5f;
-            float y1 = cy - bh * 0.5f;
-            float x2 = cx + bw * 0.5f;
-            float y2 = cy + bh * 0.5f;
-
-            float left = Math.max(0f, ((x1 - padX) / scale) * scaleToOutX);
-            float top = Math.max(0f, ((y1 - padY) / scale) * scaleToOutY);
-            float right = Math.min(outputWidth, ((x2 - padX) / scale) * scaleToOutX);
-            float bottom = Math.min(outputHeight, ((y2 - padY) / scale) * scaleToOutY);
-
-            float boxWidth = right - left;
-            float boxHeight = bottom - top;
-            if (boxWidth <= 0f || boxHeight <= 0f
-                    || boxWidth > maxBoxWidth || boxHeight > maxBoxHeight) {
-                continue;
-            }
-
-            RectF box = new RectF(left, top, right, bottom);
-
-            // Schwache Boxen nur zulassen, wenn dort kurz vorher schon eine Box war
-            if (!strong && !nearPreviousBox(box)) {
-                continue;
-            }
-
-            candidates.add(new Candidate(box, enemyScore));
         }
 
-        // Doppelte Boxen per NMS herausfiltern
+        // Doppelte Enemy-Boxen per NMS herausfiltern
         Collections.sort(candidates, (a, b) -> Float.compare(b.score, a.score));
         List<Candidate> kept = new ArrayList<>();
         for (Candidate c : candidates) {
@@ -449,7 +448,12 @@ public class YoloDetector {
             }
         }
 
-        // Boxen dieses Bildes für das nächste Bild merken (bei leerem Bild bleiben die alten kurz erhalten)
+        // Eigene Position (Me) am Ende anfügen, damit bestehende Zugriffe auf Enemy zuerst kommen
+        if (bestMeBox != null) {
+            results.add(new ColorDetector.Detection(bestMeBox, ColorDetector.TargetType.ME));
+        }
+
+        // Enemy-Boxen dieses Bildes für das nächste Bild merken
         if (!kept.isEmpty()) {
             lastBoxes.clear();
             for (Candidate k : kept) {
@@ -473,40 +477,39 @@ public class YoloDetector {
         return results;
     }
 
-    private boolean nearPreviousBox(RectF box) {
-        for (RectF previous : lastBoxes) {
-            if (calculateIoU(box, previous) > 0.2f) {
-                return true;
-            }
+    private RectF decodeBox(
+            int boxIndex,
+            boolean normalized,
+            float scaleToOutX,
+            float scaleToOutY,
+            int outputWidth,
+            int outputHeight,
+            float maxBoxWidth,
+            float maxBoxHeight
+    ) {
+        float cx = getOut(0, boxIndex);
+        float cy = getOut(1, boxIndex);
+        float bw = getOut(2, boxIndex);
+        float bh = getOut(3, boxIndex);
+
+        if (normalized) {
+            cx *= inputWidth;
+            cy *= inputHeight;
+            bw *= inputWidth;
+            bh *= inputHeight;
         }
-        return false;
-    }
 
-    private float getOut(int channel, int boxIndex) {
-        if (isOutputChannelsFirst) {
-            return outputBuffer[0][channel][boxIndex];
-        } else {
-            return outputBuffer[0][boxIndex][channel];
-        }
-    }
+        float x1 = cx - bw * 0.5f;
+        float y1 = cy - bh * 0.5f;
+        float x2 = cx + bw * 0.5f;
+        float y2 = cy + bh * 0.5f;
 
-    private float calculateIoU(RectF a, RectF b) {
-        float interLeft = Math.max(a.left, b.left);
-        float interTop = Math.max(a.top, b.top);
-        float interRight = Math.min(a.right, b.right);
-        float interBottom = Math.min(a.bottom, b.bottom);
+        float left = Math.max(0f, ((x1 - padX) / scale) * scaleToOutX);
+        float top = Math.max(0f, ((y1 - padY) / scale) * scaleToOutY);
+        float right = Math.min(outputWidth, ((x2 - padX) / scale) * scaleToOutX);
+        float bottom = Math.min(outputHeight, ((y2 - padY) / scale) * scaleToOutY);
 
-        float interW = Math.max(0f, interRight - interLeft);
-        float interH = Math.max(0f, interBottom - interTop);
-        float interArea = interW * interH;
-
-        float areaA = Math.max(0f, a.width()) * Math.max(0f, a.height());
-        float areaB = Math.max(0f, b.width()) * Math.max(0f, b.height());
-        float union = areaA + areaB - interArea;
-        return union > 0f ? interArea / union : 0f;
-    }
-
-    public synchronized void close() {
-        closeInterpreter();
-    }
-            }
+        float boxWidth = right - left;
+        float boxHeight = bottom - top;
+        if (boxWidth <= 0f || boxHeight <= 0f
+                || boxWidth > maxBoxWidth || box
