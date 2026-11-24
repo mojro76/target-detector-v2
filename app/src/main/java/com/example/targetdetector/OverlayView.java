@@ -213,4 +213,4 @@ public class OverlayView extends View {
 
         postInvalidateOnAnimation();
     }
-                       }
+}
