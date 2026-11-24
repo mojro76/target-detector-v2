@@ -17,16 +17,19 @@ public class OverlayView extends View {
     private static final int COLOR_TEAMMATE = Color.rgb(155, 190, 255);
     private static final int COLOR_ENEMY = Color.rgb(255, 155, 155);
 
-    // Einstellungen für das flüssige Mitlaufen
+    // ===== Einstellungen =====
+    // LATENCY_MS: Wie weit die Box vorausschaut.
+    //   Hängt die Box beim Laufen hinterher -> Zahl erhöhen (z. B. 160).
+    //   Läuft die Box dem Gegner voraus     -> Zahl senken (z. B. 100).
+    private static final float LATENCY_MS = 130f;
     private static final long HOLD_MS = 250;                // so lange bleibt eine verpasste Box stehen
-    private static final float LATENCY_MS = 40f;            // geschätzte Verzögerung der KI (Vorausschau)
-    private static final float MAX_EXTRAPOLATION_MS = 150f; // so weit wird höchstens vorausgerechnet
-    private static final float MAX_OFFSET_RATIO = 0.6f;     // Vorausschau höchstens 60 % der Boxgröße
+    private static final float MAX_EXTRAPOLATION_MS = 250f; // so weit wird höchstens vorausgerechnet
+    private static final float MAX_OFFSET_RATIO = 1.0f;     // Vorausschau höchstens so groß wie die Box
     private static final float MAX_SPEED = 2.0f;            // max. Geschwindigkeit in Pixel pro ms
     private static final float MIN_SPEED = 0.08f;           // darunter gilt der Gegner als stehend
     private static final float MIN_DEADZONE_PX = 10f;       // kleinere Bewegungen werden ignoriert
-    private static final float DEADZONE_RATIO = 0.10f;      // ... oder 10 % der Boxgröße
-    private static final float POS_SMOOTH_MS = 40f;         // Weichheit der Bewegung
+    private static final float DEADZONE_RATIO = 0.08f;      // ... oder 8 % der Boxgröße
+    private static final float POS_SMOOTH_MS = 25f;         // Weichheit der Bewegung (kleiner = enger dran)
     private static final float SIZE_SMOOTH_MS = 90f;        // Weichheit der Boxgröße
 
     private static class Track {
@@ -107,11 +110,11 @@ public class OverlayView extends View {
                     t.vy *= 0.5f;
                 } else {
                     float dt = now - t.measTime;
-                    if (dt >= 15f) {
+                    if (dt >= 30f) {
                         float rvx = clamp((dcx - t.mcx) / dt, -MAX_SPEED, MAX_SPEED);
                         float rvy = clamp((dcy - t.mcy) / dt, -MAX_SPEED, MAX_SPEED);
-                        t.vx = 0.65f * t.vx + 0.35f * rvx;
-                        t.vy = 0.65f * t.vy + 0.35f * rvy;
+                        t.vx = 0.4f * t.vx + 0.6f * rvx;
+                        t.vy = 0.4f * t.vy + 0.6f * rvy;
                     }
                     t.mcx = dcx;
                     t.mcy = dcy;
