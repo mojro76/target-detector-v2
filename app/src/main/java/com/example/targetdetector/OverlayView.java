@@ -27,12 +27,14 @@ public class OverlayView extends View {
     // Positionsänderungen unter 8 Pixel werden ignoriert (gegen Zittern)
     private static final float CENTER_DEADZONE_PX = 8f;
     // Länge der Ecken im Verhältnis zur Boxgröße
-    private static final float CORNER_RATIO = 0.25f;
+    private static final float CORNER_RATIO = 0.35f;
     // Durchsichtigkeit der Ecken (0 = unsichtbar, 255 = voll sichtbar)
-    private static final int CORNER_ALPHA = 200;
+    private static final int CORNER_ALPHA = 235;
 
     // Zielpunkt bei 65 % der Boxhöhe von oben (Körper statt Name/Lebensbalken)
     private static final float AIM_Y_FACTOR = 0.65f;
+    // Wird "Ich" von der KI mal nicht erkannt, bleibt die letzte Position so lange als Linienstart gültig
+    private static final long ME_HOLD_MS = 900;
     // Ziellinie: dünn und leicht durchsichtig, damit die KI sie kaum sieht
     private static final float AIM_LINE_WIDTH = 3f;
     private static final int AIM_LINE_ALPHA = 170;
@@ -43,6 +45,8 @@ public class OverlayView extends View {
     private List<ColorDetector.Detection> detections = new ArrayList<>();
     private String debugText = "Starte...";
     private long lastHitTime = 0;
+    private RectF meBox = null;
+    private long meTime = 0;
 
     public OverlayView(Context context) {
         super(context);
@@ -67,15 +71,36 @@ public class OverlayView extends View {
         post(() -> {
             debugText = status;
             long now = SystemClock.uptimeMillis();
-            if (!filtered.isEmpty()) {
+
+            // "Ich" getrennt von den Gegnern behandeln, damit die Linie nicht abreißt
+            List<ColorDetector.Detection> others = new ArrayList<>();
+            for (ColorDetector.Detection d : filtered) {
+                if (isMe(d.type)) {
+                    updateMe(d.box, now);
+                } else {
+                    others.add(d);
+                }
+            }
+
+            if (!others.isEmpty()) {
                 // Neue Boxen sofort übernehmen, nur Mini-Schwankungen werden geschluckt
-                detections = stabilize(filtered, detections);
+                detections = stabilize(others, detections);
                 lastHitTime = now;
             } else if (now - lastHitTime > HOLD_MS) {
-                detections = filtered;
+                detections = others;
             }
             invalidate();
         });
+    }
+
+    private void updateMe(RectF fresh, long now) {
+        if (meBox != null && Math.hypot(fresh.centerX() - meBox.centerX(),
+                fresh.centerY() - meBox.centerY()) < CENTER_DEADZONE_PX) {
+            // Mini-Schwankung: alte Position behalten
+        } else {
+            meBox = new RectF(fresh);
+        }
+        meTime = now;
     }
 
     // "Ich" kann je nach YoloDetector-Version als ME oder PLAYER kommen
@@ -210,14 +235,7 @@ public class OverlayView extends View {
             canvas.drawText(debugText, 40f, 100f, textPaint);
         }
 
-        RectF meBox = null;
-
         for (ColorDetector.Detection detection : detections) {
-            if (isMe(detection.type)) {
-                // Um mich selbst wird keine Box gezeichnet, nur als Startpunkt der Linie merken
-                meBox = detection.box;
-                continue;
-            }
             if (detection.type == ColorDetector.TargetType.TEAMMATE) {
                 paint.setColor(COLOR_TEAMMATE);
             } else {
@@ -227,8 +245,8 @@ public class OverlayView extends View {
             drawCorners(canvas, detection.box);
         }
 
-        // Ziellinie von mir zum nächstgelegenen Gegner
-        if (meBox != null) {
+        // Ziellinie von mir zum nächstgelegenen Gegner (um mich selbst wird keine Box gezeichnet)
+        if (meBox != null && SystemClock.uptimeMillis() - meTime <= ME_HOLD_MS) {
             float meX = meBox.centerX();
             float meY = aimY(meBox);
 
@@ -238,9 +256,8 @@ public class OverlayView extends View {
                 if (detection.type != ColorDetector.TargetType.ENEMY) {
                     continue;
                 }
-                float ex = detection.box.centerX();
-                float ey = aimY(detection.box);
-                float dist = (float) Math.hypot(ex - meX, ey - meY);
+                float dist = (float) Math.hypot(detection.box.centerX() - meX,
+                        aimY(detection.box) - meY);
                 if (dist < nearestDist) {
                     nearestDist = dist;
                     nearest = detection.box;
