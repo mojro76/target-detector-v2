@@ -18,8 +18,8 @@ public class OverlayView extends View {
     private static final int COLOR_ENEMY = Color.rgb(255, 110, 110);
     private static final int COLOR_AIM_LINE = Color.rgb(255, 190, 40); // gelb-orange
 
-    // Findet die KI in einem Bild gar nichts, bleiben die letzten Boxen so lange stehen (gegen Flackern)
-    private static final long HOLD_MS = 120;
+    // Verliert die KI einen Gegner kurz (z. B. beim Treffer-Effekt), bleibt seine Box so lange stehen
+    private static final long HOLD_MS = 350;
     // Ab dieser Überlappung gelten zwei Boxen derselben Art als derselbe Gegner
     private static final float DUPLICATE_IOU = 0.3f;
     // Größenänderungen unter 15 % werden ignoriert (gegen Pumpen der Box)
@@ -54,7 +54,12 @@ public class OverlayView extends View {
     private final Paint textPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private List<ColorDetector.Detection> detections = new ArrayList<>();
     private String debugText = "Starte...";
-    private long lastHitTime = 0;
+    // Wann jede Box zuletzt wirklich gesehen wurde (gleiche Reihenfolge wie detections)
+    private List<Long> seenTimes = new ArrayList<>();
+    // Wie oft jede Box hintereinander gesehen wurde. Nur bestätigte Boxen werden gehalten,
+    // damit kurz aufblitzende Fehl-Boxen nicht 350 ms stehen bleiben.
+    private List<Integer> hitCounts = new ArrayList<>();
+    private static final int MIN_HITS_FOR_HOLD = 3;
 
     // Meine letzte bekannte Position
     private RectF meBox = null;
@@ -101,13 +106,8 @@ public class OverlayView extends View {
                 }
             }
 
-            if (!others.isEmpty()) {
-                // Neue Boxen sofort übernehmen, nur Mini-Schwankungen werden geschluckt
-                detections = stabilize(others, detections);
-                lastHitTime = now;
-            } else if (now - lastHitTime > HOLD_MS) {
-                detections = others;
-            }
+            // Neue Boxen sofort übernehmen, kurz verschwundene Gegner noch HOLD_MS lang halten
+            detections = stabilize(others, detections, now);
 
             // Sicherheitsnetz: liegt "ich" auf einem Gegner, ist es keine echte Position von mir
             if (freshMe != null && !overlapsEnemy(freshMe, detections)) {
@@ -267,11 +267,15 @@ public class OverlayView extends View {
 
     // Vergleicht jede neue Box mit der passenden Box vom letzten Mal.
     // Kleine Änderungen bei Größe und Position werden ignoriert, große sofort übernommen.
+    // Alte Boxen ohne neuen Treffer bleiben bis zu HOLD_MS stehen (gegen kurzes Verschwinden).
     private List<ColorDetector.Detection> stabilize(
             List<ColorDetector.Detection> fresh,
-            List<ColorDetector.Detection> previous
+            List<ColorDetector.Detection> previous,
+            long now
     ) {
         List<ColorDetector.Detection> result = new ArrayList<>();
+        List<Long> resultSeen = new ArrayList<>();
+        List<Integer> resultHits = new ArrayList<>();
         boolean[] used = new boolean[previous.size()];
 
         for (ColorDetector.Detection d : fresh) {
@@ -297,6 +301,8 @@ public class OverlayView extends View {
 
             if (best < 0) {
                 result.add(d);
+                resultSeen.add(now);
+                resultHits.add(1);
                 continue;
             }
             used[best] = true;
@@ -320,7 +326,46 @@ public class OverlayView extends View {
 
             RectF box = new RectF(cx - w / 2f, cy - h / 2f, cx + w / 2f, cy + h / 2f);
             result.add(new ColorDetector.Detection(box, d.type));
+            resultSeen.add(now);
+            resultHits.add((best < hitCounts.size() ? hitCounts.get(best) : 0) + 1);
         }
+
+        // Nicht wiedergefundene Boxen noch kurz behalten, wenn sie nicht auf einer neuen Box liegen
+        for (int i = 0; i < previous.size(); i++) {
+            if (used[i] || i >= seenTimes.size()) {
+                continue;
+            }
+            long seen = seenTimes.get(i);
+            int hits = i < hitCounts.size() ? hitCounts.get(i) : 0;
+            // Nur bestätigte Boxen halten, und nur kurz
+            if (now - seen > HOLD_MS || hits < MIN_HITS_FOR_HOLD) {
+                continue;
+            }
+            ColorDetector.Detection p = previous.get(i);
+            // Steht eine neue Box derselben Art in der Nähe, ist das derselbe Gegner,
+            // der sich nur schnell bewegt hat -> alte Box nicht als "Geist" stehen lassen
+            boolean covered = false;
+            float near = Math.max(p.box.width(), p.box.height()) * 1.5f;
+            for (ColorDetector.Detection r : result) {
+                if (!sameKind(p.type, r.type)) {
+                    continue;
+                }
+                if (iou(p.box, r.box) > DUPLICATE_IOU
+                        || Math.hypot(p.box.centerX() - r.box.centerX(),
+                        p.box.centerY() - r.box.centerY()) < near) {
+                    covered = true;
+                    break;
+                }
+            }
+            if (!covered) {
+                result.add(p);
+                resultSeen.add(seen);
+                resultHits.add(hits);
+            }
+        }
+
+        seenTimes = resultSeen;
+        hitCounts = resultHits;
         return result;
     }
 
