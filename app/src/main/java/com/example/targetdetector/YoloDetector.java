@@ -26,7 +26,8 @@ public class YoloDetector {
     private static final String TAG = "YoloDetector";
     private static final String MODEL_FILE = "best.tflite";
     private static final int TARGET_CLASS_ID = 1; // 1 = Enemy
-    private static final float CONFIDENCE_THRESHOLD = 0.25f; // neue Enemy-Boxen brauchen mindestens diesen Wert
+    private static final float CONFIDENCE_THRESHOLD = 0.30f; // neue Enemy-Boxen brauchen mindestens diesen Wert
+    private static final float TRACK_SURE_SCORE = 0.50f;      // erst ab diesem Wert gilt ein KI-Treffer als "sicher" für die Verfolgung
     private static final float LOW_THRESHOLD = 0.12f;        // schon bekannte Enemy-Boxen dürfen bis hierher fallen
 
     // ===== "Ich" über den grünen Ring unter meiner Figur finden =====
@@ -57,9 +58,11 @@ public class YoloDetector {
     private static final float RED_CENTER_X_MIN = 0.12f;
     private static final float RED_CENTER_X_MAX = 0.88f;
     // Form des Rings (Anteil von Bildbreite/-höhe)
+    private static final float GREEN_CENTER_X_MIN = 0.12f;
+    private static final float GREEN_CENTER_X_MAX = 0.81f;
     private static final float RING_MIN_W = 0.030f;
     private static final float RING_MAX_W = 0.060f;    // Ring ist im Spiel immer etwa gleich groß; größere grüne Flächen (z. B. Spielfeldlinien) fliegen raus
-    private static final float RING_MIN_H = 0.045f;    // Lebensbalken und Name sind flacher -> fliegen raus
+    private static final float RING_MIN_H = 0.055f;    // Lebensbalken und Name sind flacher -> fliegen raus
     private static final float RING_MIN_ASPECT = 0.7f;
     private static final float RING_MAX_ASPECT = 4.2f;
     private static final int RING_MIN_PIXELS = 20;
@@ -75,11 +78,14 @@ public class YoloDetector {
     private long lastRingTime = 0;
     private int lastRingPixels = 0;
     private int lastRedAdded = 0;
+    // Suchfenster für den blassen Ring im Busch (null = normale Suche)
+    private RectF weakWindow = null;
+    private static final long RING_WEAK_MS = 1500;     // so lange nach dem letzten Treffer darf im Busch weitergesucht werden
     // Breite meines letzten vollständigen Rings (gegen halbe Ringe bei Explosionen)
     private float lastGoodRingW = 0f;
 
     // ===== Gegner weiterverfolgen, wenn KI und Ring kurz ausfallen (Treffer-Effekte, Busch) =====
-    private static final long TRACK_MAX_MS = 600;      // so lange darf ein Gegner nur per Bildvergleich verfolgt werden
+    private static final long TRACK_MAX_MS = 400;      // so lange darf ein Gegner nur per Bildvergleich verfolgt werden
     private static final int TRACK_MIN_HITS = 3;       // nur Gegner, die vorher mehrmals sicher erkannt wurden
     private static final float TRACK_MAX_DIFF = 20f;   // mittlere Grauwert-Abweichung, ab der "nicht mehr gefunden" gilt
     private static final int TRACK_PIXEL_CAP = 60;     // höchstens so viel zählt ein einzelnes Pixel
@@ -503,8 +509,10 @@ public class YoloDetector {
 
         // Alle Gegner-Boxen dieses Bildes (Bildschirmpixel)
         List<RectF> enemyOut = new ArrayList<>();
+        List<Boolean> enemySure = new ArrayList<>();   // sicher erkannt? (nur solche Gegner dürfen später verfolgt werden)
         for (Candidate k : kept) {
             enemyOut.add(k.box);
+            enemySure.add(k.score >= TRACK_SURE_SCORE);
         }
 
         // Rote Ringe = Gegner. Nur ergänzen, wo die KI selbst keinen Gegner gefunden hat.
@@ -526,12 +534,13 @@ public class YoloDetector {
             }
             if (!known) {
                 enemyOut.add(eb);
+                enemySure.add(true);
                 lastRedAdded++;
             }
         }
 
         // Gegner, die KI und Ring gerade verloren haben, per Bildvergleich weiterverfolgen
-        updateTracks(enemyOut, meBox, width, height, pixelStride, rowStride, bufferLimit,
+        updateTracks(enemyOut, enemySure, meBox, width, height, pixelStride, rowStride, bufferLimit,
                 scaleToOutX, scaleToOutY, nowMs);
 
         for (RectF b : enemyOut) {
@@ -543,11 +552,19 @@ public class YoloDetector {
         }
 
         // Enemy-Boxen dieses Bildes für das nächste Bild merken
-        if (!kept.isEmpty()) {
-            lastBoxes.clear();
-            for (Candidate k : kept) {
+        // Nur SICHERE Boxen zählen als "bekannt". Sonst könnte sich eine schwache Fehl-Box
+        // (z. B. auf einem Busch) über die niedrige Schwelle selbst ewig am Leben halten.
+        boolean anyStrong = false;
+        for (Candidate k : kept) {
+            if (k.score >= CONFIDENCE_THRESHOLD) {
+                if (!anyStrong) {
+                    lastBoxes.clear();
+                    anyStrong = true;
+                }
                 lastBoxes.add(k.box);
             }
+        }
+        if (anyStrong) {
             lastBoxesTime = nowMs;
         }
 
@@ -610,9 +627,15 @@ public class YoloDetector {
         return new RectF(left, top, right, bottom);
     }
 
-    // Helles Grün des eigenen Rings. Büsche haben fast kein Rot (R < 40), Teamkameraden sind blau, Gegner rot
+    // Helles Grün des eigenen Rings. Büsche haben kaum Rot und kaum Blau (R < 40 oder B < 25), Teamkameraden sind blau, Gegner rot
     private static boolean isRingGreen(int r, int g, int b) {
-        return r >= 40 && r <= 210 && g >= 150 && g - r >= 70 && g - b >= 70;
+        return r >= 40 && r <= 210 && b >= 25 && g >= 150 && g - r >= 70 && g - b >= 70;
+    }
+
+    // Blasseres Grün: so sieht mein Ring im Busch aus. Nur nahe meiner letzten Position erlaubt,
+    // Büsche selbst haben kaum Rot und Blau und fallen trotzdem raus.
+    private static boolean isRingGreenWeak(int r, int g, int b) {
+        return r >= 45 && r <= 200 && b >= 25 && g >= 95 && g - r >= 45 && g - b >= 25;
     }
 
     // Kräftiges Rot des Gegner-Rings. Pinke Blöcke haben deutlich mehr Blau und fliegen raus
@@ -665,6 +688,17 @@ public class YoloDetector {
         int x1 = (int) (width * (red ? RED_X_MAX : RING_X_MAX));
         int y0 = (int) (height * RING_Y_MIN);
         int y1 = (int) (height * RING_Y_MAX);
+        boolean weak = !red && weakWindow != null;
+        if (weak) {
+            // Zweiter Versuch im Busch: nur im Fenster um meine letzte Position suchen
+            x0 = Math.max(x0, (int) weakWindow.left);
+            x1 = Math.min(x1, (int) weakWindow.right);
+            y0 = Math.max(y0, (int) weakWindow.top);
+            y1 = Math.min(y1, (int) weakWindow.bottom);
+            if (x1 <= x0 || y1 <= y0) {
+                return rings;
+            }
+        }
         // Bereich unten rechts mit den Knöpfen (beim Rot größer wegen des roten Zielknopfs)
         int uiX = (int) (width * (red ? RED_UI_X : UI_X));
         int uiY = (int) (height * (red ? RED_UI_Y : UI_Y));
@@ -688,7 +722,7 @@ public class YoloDetector {
                         int r = frameBytes[idx] & 0xFF;
                         int g = frameBytes[idx + 1] & 0xFF;
                         int b = frameBytes[idx + 2] & 0xFF;
-                        if (red ? isRingRed(r, g, b) : isRingGreen(r, g, b)) {
+                        if (red ? isRingRed(r, g, b) : (weak ? isRingGreenWeak(r, g, b) : isRingGreen(r, g, b))) {
                             m = 1;
                         }
                     }
@@ -745,6 +779,22 @@ public class YoloDetector {
                 float w = maxX - minX + 1;
                 float h = maxY - minY + 1;
                 float aspect = w / h;
+                // Mein Ring ist nie ganz am Bildrand (rechts stehen grüne Würfel/Deko). Ausnahme: Busch-Suche nahe meiner letzten Position
+                if (!red && !weak) {
+                    float cxRel = (minX + maxX) * 0.5f / width;
+                    if (cxRel < GREEN_CENTER_X_MIN || cxRel > GREEN_CENTER_X_MAX) {
+                        continue;
+                    }
+                }
+                if (weak) {
+                    // Im Busch ist oft nur der untere Bogen des Rings sichtbar: flacher erlaubt, nicht hohl nötig
+                    if (count < RING_MIN_PIXELS || w < minW || w > width * 0.08f || h < height * 0.025f
+                            || aspect < RING_MIN_ASPECT || aspect > 6f) {
+                        continue;
+                    }
+                    rings.add(new Ring(new RectF(minX, minY, maxX + 1, maxY + 1), count));
+                    continue;
+                }
                 if (count < RING_MIN_PIXELS || w < minW || w > maxW || h < minH
                         || aspect < RING_MIN_ASPECT || aspect > RING_MAX_ASPECT) {
                     continue;
@@ -770,16 +820,64 @@ public class YoloDetector {
 
     // Wählt aus allen grünen Ringen meinen aus (bevorzugt nahe der letzten Position und der Bildmitte)
     private RectF findMeRing(int width, int height, int pixelStride, int rowStride, int limit, long nowMs) {
-        List<Ring> rings = findRings(false, width, height, pixelStride, rowStride, limit);
+        weakWindow = null;
         boolean hasLast = lastRingCx >= 0f && nowMs - lastRingTime <= RING_KEEP_MS;
+        RectF best = pickMeRing(findRings(false, width, height, pixelStride, rowStride, limit),
+                false, hasLast, width, height);
 
+        // Liegt der beste Ring NICHT dort, wo ich eben noch war (oder gibt es keinen)?
+        // Dann nahe meiner letzten Position mit blasserem Grün suchen (so sieht mein Ring im Busch aus).
+        // So springt die grüne Box nicht auf einen Busch/Fleck woanders, nur weil mein Ring kurz blass ist.
+        boolean recent = lastRingCx >= 0f && lastGoodRingW > 0f && nowMs - lastRingTime <= RING_WEAK_MS;
+        boolean bestIsNear = best != null
+                && Math.hypot(best.centerX() - lastRingCx, best.centerY() - lastRingCy) < lastGoodRingW * 1.5f;
+        boolean weakUsed = false;
+        if (recent && !bestIsNear) {
+            float r = lastGoodRingW * 2.5f;
+            weakWindow = new RectF(lastRingCx - r, lastRingCy - r, lastRingCx + r, lastRingCy + r);
+            RectF weakBest = pickMeRing(findRings(false, width, height, pixelStride, rowStride, limit),
+                    true, true, width, height);
+            weakWindow = null;
+            if (weakBest != null) {
+                // Im Busch ist der Fleck oft breiter/schmaler als der Ring: meine normale Ringgröße nehmen
+                float w = lastGoodRingW;
+                float cx = weakBest.centerX();
+                best = new RectF(cx - w * 0.5f, weakBest.bottom - w * 0.75f, cx + w * 0.5f, weakBest.bottom);
+                weakUsed = true;
+            } else if (best != null) {
+                // Weit weg von mir und nichts in meiner Nähe: nur glauben, wenn ich schon länger verschwunden bin
+                best = null;
+            }
+        }
+
+        if (best != null) {
+            if (!weakUsed) {
+                lastGoodRingW = lastGoodRingW <= 0f ? best.width() : lastGoodRingW * 0.8f + best.width() * 0.2f;
+            }
+            lastRingCx = best.centerX();
+            lastRingCy = best.centerY();
+            lastRingTime = nowMs;
+        }
+        return best;
+    }
+
+    // Wählt aus den gefundenen grünen Ringen meinen aus
+    private RectF pickMeRing(List<Ring> rings, boolean weakMode, boolean hasLast, int width, int height) {
         RectF best = null;
         float bestScore = 0f;
         int bestPixels = 0;
         for (Ring ring : rings) {
-            // Nur ein Teil des Rings sichtbar (Explosion, Effekt)? Dann lieber gar nicht nehmen,
+            // Nur ein Teil des Rings sichtbar (Explosion, Effekt)? Dann lieber nicht nehmen,
             // die letzte Position bleibt im Overlay kurz stehen.
-            if (lastGoodRingW > 0f && ring.box.width() < lastGoodRingW * 0.8f) {
+            if (lastGoodRingW > 0f && ring.box.width() < lastGoodRingW * 0.75f) {
+                continue;
+            }
+            // Im Busch-Modus muss der Ring ungefähr meine normale Größe haben
+            if (weakMode && ring.box.width() > lastGoodRingW * 1.4f) {
+                continue;
+            }
+            // Im Busch-Modus muss der Ring auf meiner Höhe liegen (mein grüner Lebensbalken ist weiter oben)
+            if (weakMode && Math.abs(ring.box.centerY() - lastRingCy) > lastGoodRingW * 0.6f) {
                 continue;
             }
             float cx = ring.box.centerX();
@@ -796,13 +894,6 @@ public class YoloDetector {
                 bestPixels = ring.pixels;
                 best = ring.box;
             }
-        }
-
-        if (best != null) {
-            lastGoodRingW = lastGoodRingW <= 0f ? best.width() : lastGoodRingW * 0.8f + best.width() * 0.2f;
-            lastRingCx = best.centerX();
-            lastRingCy = best.centerY();
-            lastRingTime = nowMs;
         }
         lastRingPixels = bestPixels;
         return best;
@@ -934,7 +1025,7 @@ public class YoloDetector {
     }
 
     // Ordnet die Gegner dieses Bildes den bekannten Gegnern zu und verfolgt verlorene weiter
-    private void updateTracks(List<RectF> enemyOut, RectF meBox, int width, int height,
+    private void updateTracks(List<RectF> enemyOut, List<Boolean> enemySure, RectF meBox, int width, int height,
                               int pixelStride, int rowStride, int limit,
                               float scaleX, float scaleY, long nowMs) {
         List<Track> next = new ArrayList<>();
@@ -942,7 +1033,9 @@ public class YoloDetector {
         lastTracked = 0;
 
         // 1) Erkannte Gegner: passenden alten Eintrag suchen, Aussehen neu merken
-        for (RectF out : enemyOut) {
+        for (int n = 0; n < enemyOut.size(); n++) {
+            RectF out = enemyOut.get(n);
+            boolean sure = enemySure.get(n);
             RectF img = new RectF(out.left / scaleX, out.top / scaleY, out.right / scaleX, out.bottom / scaleY);
             int best = -1;
             float bestDist = Float.MAX_VALUE;
@@ -961,10 +1054,12 @@ public class YoloDetector {
             if (best >= 0) {
                 used[best] = true;
                 t = tracks.get(best);
-                t.hits++;
+                if (sure) {
+                    t.hits++;
+                }
             } else {
                 t = new Track();
-                t.hits = 1;
+                t.hits = sure ? 1 : 0;
             }
             t.box = img;
             t.lastDetected = nowMs;
