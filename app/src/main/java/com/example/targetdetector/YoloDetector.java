@@ -31,7 +31,11 @@ public class YoloDetector {
     private static final float LOW_THRESHOLD = 0.12f;        // schon bekannte Enemy-Boxen dürfen bis hierher fallen
     private static final float ME_CONFIDENCE_THRESHOLD = 0.22f; // neue Me-Box braucht mindestens diesen Wert
     private static final float ME_LOW_THRESHOLD = 0.10f;        // schon bekannte Me-Box darf bis hierher fallen
-    private static final long ME_KEEP_MS = 600;
+    private static final float ME_CENTRAL_THRESHOLD = 0.15f;   // in der Bildmitte reicht ein niedrigerer Wert
+    private static final float ME_CENTER_Y = 0.55f;             // Figur steht meist etwas unter der Mitte
+    private static final float ME_CENTER_RADIUS = 0.35f;        // so weit reicht der Mitte-Bonus
+    private static final float ME_CENTER_BONUS = 0.20f;
+    private static final long ME_KEEP_MS = 800;
     private RectF lastMeBox = null;
     private long lastMeTime = 0;
     private static final long KEEP_MS = 300;                 // so lange merkt sich die KI die letzten Boxen
@@ -419,27 +423,35 @@ public class YoloDetector {
             }
 
             if (checkMe) {
-                // Me darf knapp hinter einer anderen Klasse liegen (z. B. Enemy/Teammate), nicht klar dahinter
-                boolean meIsBest = true;
-                for (int c = 4; c < numChannels; c++) {
-                    if (c != meChannel && getOut(c, i) > meScore * 1.1f) {
-                        meIsBest = false;
-                        break;
-                    }
+                if (decodedBox == null) {
+                    decodedBox = decodeBox(i, normalized, scaleToOutX, scaleToOutY,
+                            outputWidth, outputHeight, maxBoxWidth, maxBoxHeight);
                 }
-                if (meIsBest) {
-                    if (decodedBox == null) {
-                        decodedBox = decodeBox(i, normalized, scaleToOutX, scaleToOutY,
-                                outputWidth, outputHeight, maxBoxWidth, maxBoxHeight);
-                    }
-                    if (decodedBox != null) {
-                        boolean near = nearLastMe(decodedBox);
-                        float eff = meScore + (near ? 0.2f : 0f);
-                        if ((meScore >= ME_CONFIDENCE_THRESHOLD || near) && eff > bestMeEff) {
-                            bestMeEff = eff;
-                            bestMeScore = meScore;
-                            bestMeBox = decodedBox;
+                if (decodedBox != null) {
+                    // Ich bin fast immer nah an der Bildschirmmitte und dort, wo ich zuletzt war.
+                    // Beides gibt Bonuspunkte, damit ein Teamkamerad am Rand nicht gewinnt.
+                    float central = centerBonus(decodedBox, outputWidth, outputHeight);
+                    boolean near = nearLastMe(decodedBox);
+                    boolean likelyMe = near || central > 0.10f;
+
+                    // Je wahrscheinlicher "ich", desto mehr darf eine andere Klasse vorne liegen
+                    float tolerance = likelyMe ? 1.6f : 1.1f;
+                    boolean meIsBest = true;
+                    for (int c = 4; c < numChannels; c++) {
+                        if (c != meChannel && getOut(c, i) > meScore * tolerance) {
+                            meIsBest = false;
+                            break;
                         }
+                    }
+
+                    boolean accepted = meScore >= ME_CONFIDENCE_THRESHOLD
+                            || near
+                            || (central > 0.10f && meScore >= ME_CENTRAL_THRESHOLD);
+                    float eff = meScore + (near ? 0.2f : 0f) + central;
+                    if (meIsBest && accepted && eff > bestMeEff) {
+                        bestMeEff = eff;
+                        bestMeScore = meScore;
+                        bestMeBox = decodedBox;
                     }
                 }
             }
@@ -503,13 +515,14 @@ public class YoloDetector {
         long tEnd = System.nanoTime();
         lastDebug = String.format(
                 Locale.US,
-                "%s Kopie:%d Umr:%d Modell:%d Nach:%d ms | Enemy:%.2f",
+                "%s Kopie:%d Umr:%d Modell:%d Nach:%d ms | Enemy:%.2f Me:%.2f",
                 usingGpu ? "GPU" : "CPU",
                 (tCopy - tStart) / 1_000_000,
                 (tPre - tCopy) / 1_000_000,
                 (tRun - tPre) / 1_000_000,
                 (tEnd - tRun) / 1_000_000,
-                enemyMax
+                enemyMax,
+                bestMeBox != null ? bestMeScore : 0f
         );
 
         return results;
@@ -554,6 +567,14 @@ public class YoloDetector {
             return null;
         }
         return new RectF(left, top, right, bottom);
+    }
+
+    // 0 am Rand, bis ME_CENTER_BONUS in der Bildmitte
+    private float centerBonus(RectF box, int outW, int outH) {
+        float dx = box.centerX() / outW - 0.5f;
+        float dy = box.centerY() / outH - ME_CENTER_Y;
+        float dist = (float) Math.hypot(dx, dy);
+        return ME_CENTER_BONUS * Math.max(0f, 1f - dist / ME_CENTER_RADIUS);
     }
 
     private boolean nearLastMe(RectF box) {
