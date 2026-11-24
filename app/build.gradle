@@ -14,6 +14,12 @@ android {
         versionName '1.0'
     }
 
+    buildTypes {
+        debug {
+            debuggable false
+        }
+    }
+
     androidResources {
         noCompress 'tflite'
     }
