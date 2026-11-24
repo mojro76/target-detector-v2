@@ -42,6 +42,9 @@ public class YoloDetector {
     private static final float RED_X_MAX = 0.97f;
     private static final float RED_UI_X = 0.72f;
     private static final float RED_UI_Y = 0.40f;
+    // Ecke unten links wird für Rot nicht durchsucht (Plakate/Werbebanden, Bewegungs-Joystick)
+    private static final float RED_LEFT_X = 0.25f;
+    private static final float RED_BOTTOM_Y = 0.70f;
     // Strengere Form für rote Ringe (gegen rote Deko am Rand, Effekte usw.)
     private static final float RED_MIN_W = 0.0375f;
     private static final float RED_MAX_W = 0.0625f;
@@ -52,7 +55,7 @@ public class YoloDetector {
     private static final float RED_CENTER_X_MAX = 0.88f;
     // Form des Rings (Anteil von Bildbreite/-höhe)
     private static final float RING_MIN_W = 0.030f;
-    private static final float RING_MAX_W = 0.066f;    // Ring ist im Spiel immer etwa gleich groß; größere grüne Flächen (z. B. Spielfeldlinien) fliegen raus
+    private static final float RING_MAX_W = 0.060f;    // Ring ist im Spiel immer etwa gleich groß; größere grüne Flächen (z. B. Spielfeldlinien) fliegen raus
     private static final float RING_MIN_H = 0.045f;    // Lebensbalken und Name sind flacher -> fliegen raus
     private static final float RING_MIN_ASPECT = 0.7f;
     private static final float RING_MAX_ASPECT = 4.2f;
@@ -69,6 +72,27 @@ public class YoloDetector {
     private long lastRingTime = 0;
     private int lastRingPixels = 0;
     private int lastRedAdded = 0;
+    // Breite meines letzten vollständigen Rings (gegen halbe Ringe bei Explosionen)
+    private float lastGoodRingW = 0f;
+
+    // ===== Gegner weiterverfolgen, wenn KI und Ring kurz ausfallen (Treffer-Effekte, Busch) =====
+    private static final long TRACK_MAX_MS = 1000;     // so lange darf ein Gegner nur per Bildvergleich verfolgt werden
+    private static final int TRACK_MIN_HITS = 3;       // nur Gegner, die vorher mehrmals sicher erkannt wurden
+    private static final float TRACK_MAX_DIFF = 18f;   // mittlere Grauwert-Abweichung, ab der "nicht mehr gefunden" gilt
+    private static final int TRACK_PIXEL_CAP = 40;     // höchstens so viel zählt ein einzelnes Pixel
+    private static final int TRACK_MAX = 6;            // höchstens so viele Gegner gleichzeitig verfolgen
+
+    private static class Track {
+        RectF box;          // in Bildpixeln
+        byte[] tpl;         // Graubild-Ausschnitt (jedes 2. Pixel)
+        int tw;
+        int th;
+        int hits;
+        long lastDetected;
+    }
+
+    private List<Track> tracks = new ArrayList<>();
+    private int lastTracked = 0;
 
     private static final long KEEP_MS = 300;                 // so lange merkt sich die KI die letzten Boxen
     private static final float IOU_THRESHOLD = 0.45f;
@@ -471,8 +495,10 @@ public class YoloDetector {
             }
         }
 
+        // Alle Gegner-Boxen dieses Bildes (Bildschirmpixel)
+        List<RectF> enemyOut = new ArrayList<>();
         for (Candidate k : kept) {
-            results.add(new ColorDetector.Detection(k.box, ColorDetector.TargetType.ENEMY));
+            enemyOut.add(k.box);
         }
 
         // Rote Ringe = Gegner. Nur ergänzen, wo die KI selbst keinen Gegner gefunden hat.
@@ -493,9 +519,17 @@ public class YoloDetector {
                 known = true;
             }
             if (!known) {
-                results.add(new ColorDetector.Detection(eb, ColorDetector.TargetType.ENEMY));
+                enemyOut.add(eb);
                 lastRedAdded++;
             }
+        }
+
+        // Gegner, die KI und Ring gerade verloren haben, per Bildvergleich weiterverfolgen
+        updateTracks(enemyOut, meBox, width, height, pixelStride, rowStride, bufferLimit,
+                scaleToOutX, scaleToOutY, nowMs);
+
+        for (RectF b : enemyOut) {
+            results.add(new ColorDetector.Detection(b, ColorDetector.TargetType.ENEMY));
         }
 
         if (meBox != null) {
@@ -514,7 +548,7 @@ public class YoloDetector {
         long tEnd = System.nanoTime();
         lastDebug = String.format(
                 Locale.US,
-                "%s Kopie:%d Umr:%d Modell:%d Nach:%d ms | Enemy:%.2f Ring:%d Rot:+%d",
+                "%s Kopie:%d Umr:%d Modell:%d Nach:%d ms | Enemy:%.2f Ring:%d Rot:+%d Verf:+%d",
                 usingGpu ? "GPU" : "CPU",
                 (tCopy - tStart) / 1_000_000,
                 (tPre - tCopy) / 1_000_000,
@@ -522,7 +556,8 @@ public class YoloDetector {
                 (tEnd - tRun) / 1_000_000,
                 enemyMax,
                 lastRingPixels,
-                lastRedAdded
+                lastRedAdded,
+                lastTracked
         );
 
         return results;
@@ -627,6 +662,8 @@ public class YoloDetector {
         // Bereich unten rechts mit den Knöpfen (beim Rot größer wegen des roten Zielknopfs)
         int uiX = (int) (width * (red ? RED_UI_X : UI_X));
         int uiY = (int) (height * (red ? RED_UI_Y : UI_Y));
+        int leftX = (int) (width * RED_LEFT_X);
+        int bottomY = (int) (height * RED_BOTTOM_Y);
 
         // Schritt 1: alle Pixel in der gesuchten Farbe markieren
         for (int y = y0; y < y1; y++) {
@@ -634,7 +671,9 @@ public class YoloDetector {
             int base = y * width;
             for (int x = x0; x < x1; x++) {
                 byte m = 0;
-                if (!(x > uiX && y > uiY)) {
+                boolean skip = (x > uiX && y > uiY)
+                        || (red && x < leftX && y > bottomY);
+                if (!skip) {
                     int idx = rowStart + x * pixelStride;
                     if (idx + 2 < limit) {
                         int r = frameBytes[idx] & 0xFF;
@@ -729,6 +768,11 @@ public class YoloDetector {
         float bestScore = 0f;
         int bestPixels = 0;
         for (Ring ring : rings) {
+            // Nur ein Teil des Rings sichtbar (Explosion, Effekt)? Dann lieber gar nicht nehmen,
+            // die letzte Position bleibt im Overlay kurz stehen.
+            if (lastGoodRingW > 0f && ring.box.width() < lastGoodRingW * 0.8f) {
+                continue;
+            }
             float cx = ring.box.centerX();
             float cy = ring.box.centerY();
             float score = ring.pixels;
@@ -746,6 +790,7 @@ public class YoloDetector {
         }
 
         if (best != null) {
+            lastGoodRingW = lastGoodRingW <= 0f ? best.width() : lastGoodRingW * 0.8f + best.width() * 0.2f;
             lastRingCx = best.centerX();
             lastRingCy = best.centerY();
             lastRingTime = nowMs;
@@ -763,6 +808,192 @@ public class YoloDetector {
         float bottom = ring.bottom * scaleY;
         float top = (ring.bottom - w * ME_BOX_HEIGHT) * scaleY;
         return new RectF(left, Math.max(0f, top), right, bottom);
+    }
+
+    private int gray(int x, int y, int pixelStride, int rowStride, int limit) {
+        int idx = y * rowStride + x * pixelStride;
+        if (idx < 0 || idx + 2 >= limit) {
+            return 0;
+        }
+        return ((frameBytes[idx] & 0xFF) + 2 * (frameBytes[idx + 1] & 0xFF) + (frameBytes[idx + 2] & 0xFF)) >> 2;
+    }
+
+    // Merkt sich das aktuelle Aussehen des Gegners (jedes 2. Pixel als Graubild)
+    private void captureTemplate(Track t, int width, int height, int pixelStride, int rowStride, int limit) {
+        int x0 = Math.max(0, (int) t.box.left);
+        int y0 = Math.max(0, (int) t.box.top);
+        int x1 = Math.min(width - 1, (int) t.box.right);
+        int y1 = Math.min(height - 1, (int) t.box.bottom);
+        int tw = (x1 - x0) / 2;
+        int th = (y1 - y0) / 2;
+        if (tw < 4 || th < 4) {
+            t.tpl = null;
+            return;
+        }
+        byte[] tpl = new byte[tw * th];
+        for (int j = 0; j < th; j++) {
+            for (int i = 0; i < tw; i++) {
+                tpl[j * tw + i] = (byte) gray(x0 + 2 * i, y0 + 2 * j, pixelStride, rowStride, limit);
+            }
+        }
+        t.tpl = tpl;
+        t.tw = tw;
+        t.th = th;
+        t.box = new RectF(x0, y0, x0 + 2 * tw, y0 + 2 * th);
+    }
+
+    // Abweichung des gemerkten Aussehens an Position (x0, y0); bricht ab, sobald es schlechter als limitSad wird
+    private long sad(Track t, int x0, int y0, long limitSad, int pixelStride, int rowStride, int limit) {
+        long sum = 0;
+        for (int j = 0; j < t.th; j++) {
+            int y = y0 + 2 * j;
+            int row = j * t.tw;
+            for (int i = 0; i < t.tw; i++) {
+                int d = gray(x0 + 2 * i, y, pixelStride, rowStride, limit) - (t.tpl[row + i] & 0xFF);
+                if (d < 0) {
+                    d = -d;
+                }
+                // Gedeckelt: verdeckte Stellen (Treffer-Blitz, Schadenszahl) zählen nicht übermäßig
+                sum += Math.min(d, TRACK_PIXEL_CAP);
+            }
+            if (sum >= limitSad) {
+                return sum;
+            }
+        }
+        return sum;
+    }
+
+    // Sucht den Gegner in der Nähe seiner letzten Position. Liefert die neue Box oder null.
+    private RectF findByTemplate(Track t, int width, int height, int pixelStride, int rowStride, int limit) {
+        int bw = 2 * t.tw;
+        int bh = 2 * t.th;
+        int sx = (int) t.box.left;
+        int sy = (int) t.box.top;
+        int range = Math.max(6, (int) (bw * 0.6f));
+
+        long best = Long.MAX_VALUE;
+        int bestX = sx;
+        int bestY = sy;
+        // Grob suchen (2er-Schritte) ...
+        for (int dy = -range; dy <= range; dy += 2) {
+            for (int dx = -range; dx <= range; dx += 2) {
+                int x = sx + dx;
+                int y = sy + dy;
+                if (x < 0 || y < 0 || x + bw >= width || y + bh >= height) {
+                    continue;
+                }
+                long v = sad(t, x, y, best, pixelStride, rowStride, limit);
+                if (v < best) {
+                    best = v;
+                    bestX = x;
+                    bestY = y;
+                }
+            }
+        }
+        // ... dann fein um die beste Stelle
+        int cx = bestX;
+        int cy = bestY;
+        for (int dy = -1; dy <= 1; dy++) {
+            for (int dx = -1; dx <= 1; dx++) {
+                int x = cx + dx;
+                int y = cy + dy;
+                if ((dx == 0 && dy == 0) || x < 0 || y < 0 || x + bw >= width || y + bh >= height) {
+                    continue;
+                }
+                long v = sad(t, x, y, best, pixelStride, rowStride, limit);
+                if (v < best) {
+                    best = v;
+                    bestX = x;
+                    bestY = y;
+                }
+            }
+        }
+        if (best == Long.MAX_VALUE) {
+            return null;
+        }
+        float meanDiff = (float) best / (t.tw * t.th);
+        if (meanDiff > TRACK_MAX_DIFF) {
+            return null; // nicht mehr gefunden (z. B. unsichtbar im Busch)
+        }
+        return new RectF(bestX, bestY, bestX + bw, bestY + bh);
+    }
+
+    // Ordnet die Gegner dieses Bildes den bekannten Gegnern zu und verfolgt verlorene weiter
+    private void updateTracks(List<RectF> enemyOut, RectF meBox, int width, int height,
+                              int pixelStride, int rowStride, int limit,
+                              float scaleX, float scaleY, long nowMs) {
+        List<Track> next = new ArrayList<>();
+        boolean[] used = new boolean[tracks.size()];
+        lastTracked = 0;
+
+        // 1) Erkannte Gegner: passenden alten Eintrag suchen, Aussehen neu merken
+        for (RectF out : enemyOut) {
+            RectF img = new RectF(out.left / scaleX, out.top / scaleY, out.right / scaleX, out.bottom / scaleY);
+            int best = -1;
+            float bestDist = Float.MAX_VALUE;
+            for (int i = 0; i < tracks.size(); i++) {
+                if (used[i]) {
+                    continue;
+                }
+                RectF tb = tracks.get(i).box;
+                float dist = (float) Math.hypot(img.centerX() - tb.centerX(), img.centerY() - tb.centerY());
+                if (dist < Math.max(tb.width(), tb.height()) * 0.6f && dist < bestDist) {
+                    best = i;
+                    bestDist = dist;
+                }
+            }
+            Track t;
+            if (best >= 0) {
+                used[best] = true;
+                t = tracks.get(best);
+                t.hits++;
+            } else {
+                t = new Track();
+                t.hits = 1;
+            }
+            t.box = img;
+            t.lastDetected = nowMs;
+            captureTemplate(t, width, height, pixelStride, rowStride, limit);
+            next.add(t);
+        }
+
+        // 2) Verlorene, aber vorher sichere Gegner per Bildvergleich suchen
+        for (int i = 0; i < tracks.size(); i++) {
+            if (used[i]) {
+                continue;
+            }
+            Track t = tracks.get(i);
+            if (t.tpl == null || t.hits < TRACK_MIN_HITS || nowMs - t.lastDetected > TRACK_MAX_MS) {
+                continue;
+            }
+            RectF moved = findByTemplate(t, width, height, pixelStride, rowStride, limit);
+            if (moved == null) {
+                continue;
+            }
+            RectF out = new RectF(moved.left * scaleX, moved.top * scaleY, moved.right * scaleX, moved.bottom * scaleY);
+            // Nicht auf mich und nicht doppelt auf einen schon erkannten Gegner legen
+            boolean clash = meBox != null && calculateIoU(meBox, out) > 0.3f;
+            for (RectF e : enemyOut) {
+                if (clash) {
+                    break;
+                }
+                if (calculateIoU(e, out) > 0.3f) {
+                    clash = true;
+                }
+            }
+            if (clash) {
+                continue;
+            }
+            t.box = moved; // Aussehen NICHT neu merken, sonst wandert die Box langsam weg
+            next.add(t);
+            enemyOut.add(out);
+            lastTracked++;
+        }
+
+        if (next.size() > TRACK_MAX) {
+            next = new ArrayList<>(next.subList(0, TRACK_MAX));
+        }
+        tracks = next;
     }
 
     private boolean nearPreviousBox(RectF box) {
