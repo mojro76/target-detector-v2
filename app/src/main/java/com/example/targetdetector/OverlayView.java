@@ -16,10 +16,11 @@ public class OverlayView extends View {
     private static final int COLOR_PLAYER = Color.rgb(155, 255, 155);
     private static final int COLOR_TEAMMATE = Color.rgb(155, 190, 255);
     private static final int COLOR_ENEMY = Color.rgb(255, 155, 155);
+    private static final int COLOR_AIM_LINE = Color.rgb(255, 190, 40); // gelb-orange
 
     // Findet die KI in einem Bild gar nichts, bleiben die letzten Boxen so lange stehen (gegen Flackern)
     private static final long HOLD_MS = 120;
-    // Ab dieser Überlappung gelten zwei Boxen als derselbe Gegner
+    // Ab dieser Überlappung gelten zwei Boxen derselben Art als derselbe Gegner
     private static final float DUPLICATE_IOU = 0.3f;
     // Größenänderungen unter 15 % werden ignoriert (gegen Pumpen der Box)
     private static final float SIZE_TOLERANCE = 0.15f;
@@ -30,7 +31,14 @@ public class OverlayView extends View {
     // Durchsichtigkeit der Ecken (0 = unsichtbar, 255 = voll sichtbar)
     private static final int CORNER_ALPHA = 200;
 
+    // Zielpunkt bei 65 % der Boxhöhe von oben (Körper statt Name/Lebensbalken)
+    private static final float AIM_Y_FACTOR = 0.65f;
+    // Ziellinie: dünn und leicht durchsichtig, damit die KI sie kaum sieht
+    private static final float AIM_LINE_WIDTH = 3f;
+    private static final int AIM_LINE_ALPHA = 170;
+
     private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint linePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint textPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private List<ColorDetector.Detection> detections = new ArrayList<>();
     private String debugText = "Starte...";
@@ -42,6 +50,12 @@ public class OverlayView extends View {
         paint.setStyle(Paint.Style.STROKE);
         paint.setStrokeWidth(4f);
         paint.setStrokeCap(Paint.Cap.SQUARE);
+
+        linePaint.setStyle(Paint.Style.STROKE);
+        linePaint.setStrokeWidth(AIM_LINE_WIDTH);
+        linePaint.setStrokeCap(Paint.Cap.ROUND);
+        linePaint.setColor(COLOR_AIM_LINE);
+        linePaint.setAlpha(AIM_LINE_ALPHA);
 
         textPaint.setColor(Color.YELLOW);
         textPaint.setTextSize(30f);
@@ -64,6 +78,15 @@ public class OverlayView extends View {
         });
     }
 
+    // "Ich" kann je nach YoloDetector-Version als ME oder PLAYER kommen
+    private static boolean isMe(ColorDetector.TargetType type) {
+        return type == ColorDetector.TargetType.ME || type == ColorDetector.TargetType.PLAYER;
+    }
+
+    private static boolean sameKind(ColorDetector.TargetType a, ColorDetector.TargetType b) {
+        return a == b || (isMe(a) && isMe(b));
+    }
+
     // Vergleicht jede neue Box mit der passenden Box vom letzten Mal.
     // Kleine Änderungen bei Größe und Position werden ignoriert, große sofort übernommen.
     private List<ColorDetector.Detection> stabilize(
@@ -84,7 +107,7 @@ public class OverlayView extends View {
             float bestDist = Float.MAX_VALUE;
             for (int i = 0; i < previous.size(); i++) {
                 ColorDetector.Detection p = previous.get(i);
-                if (used[i] || p.type != d.type) {
+                if (used[i] || !sameKind(p.type, d.type)) {
                     continue;
                 }
                 float dist = (float) Math.hypot(dcx - p.box.centerX(), dcy - p.box.centerY());
@@ -124,13 +147,17 @@ public class OverlayView extends View {
         return result;
     }
 
-    // Die KI liefert die sicherste Box zuerst. Jede weitere Box, die stark mit einer
-    // schon behaltenen überlappt oder deren Mitte darin liegt, wird verworfen.
+    // Die KI liefert die sicherste Box zuerst. Jede weitere Box derselben Art, die stark
+    // mit einer schon behaltenen überlappt oder deren Mitte darin liegt, wird verworfen.
+    // Ich und Gegner werden getrennt behandelt, damit sie sich im Nahkampf nicht gegenseitig löschen.
     private List<ColorDetector.Detection> removeDuplicates(List<ColorDetector.Detection> list) {
         List<ColorDetector.Detection> result = new ArrayList<>();
         for (ColorDetector.Detection d : list) {
             boolean duplicate = false;
             for (ColorDetector.Detection k : result) {
+                if (!sameKind(k.type, d.type)) {
+                    continue;
+                }
                 if (iou(d.box, k.box) > DUPLICATE_IOU
                         || k.box.contains(d.box.centerX(), d.box.centerY())
                         || d.box.contains(k.box.centerX(), k.box.centerY())) {
@@ -171,6 +198,10 @@ public class OverlayView extends View {
         canvas.drawLine(b.right, b.bottom, b.right, b.bottom - len, paint);
     }
 
+    private static float aimY(RectF b) {
+        return b.top + b.height() * AIM_Y_FACTOR;
+    }
+
     @Override
     protected void onDraw(Canvas canvas) {
         super.onDraw(canvas);
@@ -179,16 +210,46 @@ public class OverlayView extends View {
             canvas.drawText(debugText, 40f, 100f, textPaint);
         }
 
+        RectF meBox = null;
+
         for (ColorDetector.Detection detection : detections) {
-            if (detection.type == ColorDetector.TargetType.PLAYER) {
-                paint.setColor(COLOR_PLAYER);
-            } else if (detection.type == ColorDetector.TargetType.TEAMMATE) {
+            if (isMe(detection.type)) {
+                // Um mich selbst wird keine Box gezeichnet, nur als Startpunkt der Linie merken
+                meBox = detection.box;
+                continue;
+            }
+            if (detection.type == ColorDetector.TargetType.TEAMMATE) {
                 paint.setColor(COLOR_TEAMMATE);
             } else {
                 paint.setColor(COLOR_ENEMY);
             }
             paint.setAlpha(CORNER_ALPHA);
             drawCorners(canvas, detection.box);
+        }
+
+        // Ziellinie von mir zum nächstgelegenen Gegner
+        if (meBox != null) {
+            float meX = meBox.centerX();
+            float meY = aimY(meBox);
+
+            RectF nearest = null;
+            float nearestDist = Float.MAX_VALUE;
+            for (ColorDetector.Detection detection : detections) {
+                if (detection.type != ColorDetector.TargetType.ENEMY) {
+                    continue;
+                }
+                float ex = detection.box.centerX();
+                float ey = aimY(detection.box);
+                float dist = (float) Math.hypot(ex - meX, ey - meY);
+                if (dist < nearestDist) {
+                    nearestDist = dist;
+                    nearest = detection.box;
+                }
+            }
+
+            if (nearest != null) {
+                canvas.drawLine(meX, meY, nearest.centerX(), aimY(nearest), linePaint);
+            }
         }
     }
 }
