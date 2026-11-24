@@ -30,6 +30,28 @@ public class YoloDetector {
     private static final float TRACK_SURE_SCORE = 0.50f;      // erst ab diesem Wert gilt ein KI-Treffer als "sicher" für die Verfolgung
     private static final float LOW_THRESHOLD = 0.12f;        // schon bekannte Enemy-Boxen dürfen bis hierher fallen
 
+    // ===== Andere KI-Klassen nutzen (Messung an deinen Aufnahmen: KI erkennt sie sehr sicher) =====
+    // 0 = Ball, 1 = Gegner, 2 = Teamkamerad, 5 = ich
+    private static final int ME_CLASS_ID = 5;
+    // Sieht die KI an derselben Stelle sicherer etwas anderes (Teamkamerad, ich, Ball ...),
+    // ist es kein Gegner. Ab diesem Wert darf eine andere Klasse eine Gegner-Box verbieten:
+    private static final float VETO_SCORE = 0.35f;
+    private static final float VETO_IOU = 0.35f;            // so stark müssen sich die Boxen überlappen
+    private static final float VETO_IOU_ME = 0.30f;         // bei "ich" etwas großzügiger
+    // KI-"Ich"-Box springt ein, wenn mein Ring gerade nicht zu sehen ist (Effekte, Busch, Gedränge)
+    private static final float AI_ME_SCORE = 0.60f;
+    private static final float AI_ME_MAX_JUMP = 3.0f;       // höchstens so viele Ringbreiten von meiner letzten Position
+    // Rote Ringe als zusätzliche Gegner: AUS. Messung: fast nur Fehl-Boxen auf orangen Kisten,
+    // und die KI verpasst sichere Gegner so gut wie nie.
+    private static final boolean RED_RINGS_ENABLED = false;
+    // Verfolgung per Bildvergleich: AUS. Messung: Sie ließ Boxen auf Büschen stehen, wenn ein Gegner
+    // hineinging. Kurze KI-Aussetzer überbrückt das Overlay ohnehin (350 ms halten).
+    private static final boolean TRACKING_ENABLED = false;
+    // Oberster Bildstreifen (Timer, Punktestand): dort sind nur SICHERE Gegner erlaubt.
+    // Messung: Echte Gegner kommen oft von oben ins Bild, aber schwache "bekannte" Boxen
+    // blieben dort am Timer hängen.
+    private static final float TOP_HUD_RATIO = 0.12f;
+
     // ===== "Ich" über den grünen Ring unter meiner Figur finden =====
     // Suchbereich (Anteil vom Bild): oben ist HUD, unten rechts sind die grünen Knöpfe
     private static final float RING_X_MIN = 0.08f;
@@ -78,14 +100,13 @@ public class YoloDetector {
     // wenn der Ring zerstückelt ist (Tor-Netz, Busch, Figur davor, Teamkamerad daneben).
     // Alle Boxen (ich und Gegner) bekommen diese feste Größe -> kein Schrumpfen/Pumpen mehr.
     private static final float RING_ASPECT = 1.28f;        // Ring ist so viel breiter als hoch (gemessen)
-    private static final float RING_BOX_SCALE = 1.06f;     // gelernte Größe -> sichtbarer Außenrand des Rings
+    private static final float RING_BOX_SCALE = 1.0f;      // Größe ist jetzt direkt der sichtbare Außenrand
     private static final float RING_SCORE_LOCAL = 0.30f;   // Mindestwert nahe meiner letzten Position
     private static final float RING_SCORE_GLOBAL = 0.45f;  // Mindestwert irgendwo im Bild (strenger)
-    private static final float RING_SCORE_SIZE = 0.50f;    // nur so gute Treffer verbessern die Größe
+    private static final float RING_SCORE_SIZE = 0.55f;    // nur so gute Treffer verbessern die Größe
     private static final float RING_SCORE_BOOT = 0.55f;    // Mindestwert beim ersten Lernen der Größe
     private static final long RING_LOCAL_MS = 1500;       // so lange wird zuerst nahe der letzten Position gesucht
     private static final long RING_RESET_MS = 5000;       // so lange nichts gefunden -> Größe neu lernen (neue Karte)
-    private static final int SIZE_HISTORY = 31;            // Größe = Mittelwert (Median) der letzten so vielen Messungen
     private static final int BOOT_SAMPLES = 3;             // so viele gute Messungen braucht das erste Lernen
     private static final int GLOBAL_CHECK_EVERY = 4;       // jedes 4. Bild zusätzlich im ganzen Bild nachsehen
 
@@ -107,6 +128,12 @@ public class YoloDetector {
     private long lastMatchTime = 0;
     private int frameCounter = 0;
     private float lastRingScore = 0f;
+    private boolean lastMeFromAi = false;      // kam meine Box in diesem Bild von der KI statt vom Ring?
+    private int lastVetoed = 0;                // so viele Gegner-Boxen wurden in diesem Bild verboten
+    // Sichere Erkennungen anderer Klassen in diesem Bild (Bildschirmpixel), z. B. Teamkameraden
+    private final List<RectF> otherBoxes = new ArrayList<>();
+    private final List<Float> otherScores = new ArrayList<>();
+    private final List<Integer> otherClasses = new ArrayList<>();
 
     // ===== Gegner weiterverfolgen, wenn KI und Ring kurz ausfallen (Treffer-Effekte, Busch) =====
     private static final long TRACK_MAX_MS = 400;      // so lange darf ein Gegner nur per Bildvergleich verfolgt werden
@@ -469,26 +496,39 @@ public class YoloDetector {
             lastBoxes.clear();
         }
 
+        List<Candidate> others = new ArrayList<>();
+        List<Integer> othersClass = new ArrayList<>();
         for (int i = 0; i < numBoxes; i++) {
-            // Schnelltest: die meisten Boxen fliegen hier sofort raus
             float enemyScore = getOut(enemyChannel, i);
             if (enemyScore > enemyMax) {
                 enemyMax = enemyScore;
             }
-            if (enemyScore < LOW_THRESHOLD) {
-                continue;
-            }
-
-            boolean strong = enemyScore >= CONFIDENCE_THRESHOLD;
             float bestOther = 0f;
+            int bestOtherClass = -1;
             for (int c = 4; c < numChannels; c++) {
                 if (c != enemyChannel) {
                     float v = getOut(c, i);
                     if (v > bestOther) {
                         bestOther = v;
+                        bestOtherClass = c - 4;
                     }
                 }
             }
+            // Sichere Erkennung einer ANDEREN Klasse merken (Teamkamerad, ich, Ball ...)
+            if (bestOther >= VETO_SCORE && bestOther > enemyScore) {
+                RectF ob = decodeBox(i, normalized, scaleToOutX, scaleToOutY,
+                        outputWidth, outputHeight, maxBoxWidth, maxBoxHeight);
+                if (ob != null) {
+                    others.add(new Candidate(ob, bestOther));
+                    othersClass.add(bestOtherClass);
+                }
+            }
+            // Schnelltest: die meisten Boxen fliegen hier sofort raus
+            if (enemyScore < LOW_THRESHOLD) {
+                continue;
+            }
+
+            boolean strong = enemyScore >= CONFIDENCE_THRESHOLD;
             // Neue Boxen: Enemy muss klar die beste Klasse sein.
             // Schwache Boxen (schon bekannt): Enemy darf knapp hinter der besten Klasse liegen.
             if (strong ? bestOther > enemyScore : bestOther > enemyScore * 1.25f) {
@@ -517,12 +557,64 @@ public class YoloDetector {
             }
         }
 
+        // Andere Klassen: doppelte Boxen entfernen (sicherste zuerst)
+        otherBoxes.clear();
+        otherScores.clear();
+        otherClasses.clear();
+        List<Integer> order = new ArrayList<>();
+        for (int i = 0; i < others.size(); i++) {
+            order.add(i);
+        }
+        Collections.sort(order, (a, b) -> Float.compare(others.get(b).score, others.get(a).score));
+        RectF aiMe = null;
+        float aiMeScore = 0f;
+        for (int idx : order) {
+            Candidate c = others.get(idx);
+            boolean dup = false;
+            for (RectF k : otherBoxes) {
+                if (calculateIoU(c.box, k) > IOU_THRESHOLD) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (dup) {
+                continue;
+            }
+            otherBoxes.add(c.box);
+            otherScores.add(c.score);
+            otherClasses.add(othersClass.get(idx));
+            if (othersClass.get(idx) == ME_CLASS_ID && aiMe == null) {
+                aiMe = c.box;
+                aiMeScore = c.score;
+            }
+        }
+
+        // Gegner-Box verbieten, wenn die KI an derselben Stelle sicherer etwas anderes sieht,
+        // oder wenn sie nur schwach erkannt ganz oben im Timer-/Punktestand-Streifen liegt
+        lastVetoed = 0;
+        float topHud = outputHeight * TOP_HUD_RATIO;
+        for (int k = kept.size() - 1; k >= 0; k--) {
+            Candidate c = kept.get(k);
+            boolean weakInHud = c.box.bottom < topHud && c.score < CONFIDENCE_THRESHOLD;
+            if (weakInHud || vetoedByOther(c.box, c.score)) {
+                kept.remove(k);
+                lastVetoed++;
+            }
+        }
+
         // "Ich" über den grünen Ring suchen (unabhängig von der KI)
         RectF meBox = null;
+        lastMeFromAi = false;
         RectF ring = findMeRing(width, height, pixelStride, rowStride, bufferLimit, nowMs);
         if (ring != null) {
             meBox = boxFromRing(ring, scaleToOutX, scaleToOutY);
-
+        } else if (aiMe != null && aiMeScore >= AI_ME_SCORE) {
+            // Ring gerade nicht zu sehen: die KI-"Ich"-Box springt ein (Mitte und Fußhöhe passen laut
+            // Messung auf 1-2 % genau zum Ring). Größe bleibt die gelernte Ringgröße.
+            meBox = meBoxFromAi(aiMe, scaleToOutX, scaleToOutY, nowMs);
+            lastMeFromAi = meBox != null;
+        }
+        if (meBox != null) {
             // Hält die KI mich selbst für einen Gegner, wird diese Gegner-Box entfernt
             for (int k = kept.size() - 1; k >= 0; k--) {
                 if (calculateIoU(meBox, kept.get(k).box) > 0.4f) {
@@ -541,7 +633,9 @@ public class YoloDetector {
 
         // Rote Ringe = Gegner. Nur ergänzen, wo die KI selbst keinen Gegner gefunden hat.
         lastRedAdded = 0;
-        List<Ring> redRings = findRings(true, width, height, pixelStride, rowStride, bufferLimit);
+        List<Ring> redRings = RED_RINGS_ENABLED
+                ? findRings(true, width, height, pixelStride, rowStride, bufferLimit)
+                : new ArrayList<>();
         for (Ring red : redRings) {
             RectF eb = boxFromRing(red.box, scaleToOutX, scaleToOutY);
             boolean known = false;
@@ -595,7 +689,7 @@ public class YoloDetector {
         long tEnd = System.nanoTime();
         lastDebug = String.format(
                 Locale.US,
-                "%s Kopie:%d Umr:%d Modell:%d Nach:%d ms | Enemy:%.2f Ring:%d%% Gr:%.0f Rot:+%d Verf:+%d",
+                "%s Kopie:%d Umr:%d Modell:%d Nach:%d ms | Enemy:%.2f Ring:%d%% Gr:%.0f%s Veto:%d Verf:+%d",
                 usingGpu ? "GPU" : "CPU",
                 (tCopy - tStart) / 1_000_000,
                 (tPre - tCopy) / 1_000_000,
@@ -604,7 +698,8 @@ public class YoloDetector {
                 enemyMax,
                 Math.round(lastRingScore * 100f),
                 ringW,
-                lastRedAdded,
+                lastMeFromAi ? " KI-Ich" : "",
+                lastVetoed,
                 lastTracked
         );
 
@@ -1003,28 +1098,49 @@ public class YoloDetector {
         return sorted.get(sorted.size() / 2);
     }
 
-    // Prüft an der gefundenen Stelle, ob der Ring etwas kleiner oder größer besser passt.
-    // Die Größe ist der Mittelwert (Median) vieler Messungen und ändert sich daher kaum.
+    // Misst die Ringbreite DIREKT: auf Höhe der Ringmitte vom äußersten grünen Pixel links bis
+    // zum äußersten rechts (die Seiten des Rings sind fast immer sichtbar, oben steht die Figur).
+    // Messung an deinen Aufnahmen: sehr genau (Median 35 px, die Hälfte aller Werte 34-36 px).
+    // Nach SIZE_LOCK_SAMPLES Messungen wird die Größe FESTGEHALTEN (bis zur nächsten Karte).
     private void updateSize(float[] best, int width, int height) {
-        float bestF = 1f;
-        float bestS = -99f;
-        float[] factors = {0.94f, 1f, 1.06f};
-        for (float f : factors) {
-            Ell e = f == 1f ? ellFor(width) : buildEll(ringW * f, width);
-            float[] r = searchEllipse(e, (int) best[0] - 1, (int) best[1] - 1,
-                    (int) best[0] + 1, (int) best[1] + 1, 1, width, height, 0f, 0f, 0f);
-            if (r != null && r[2] > bestS) {
-                bestS = r[2];
-                bestF = f;
+        if (sizeLocked) {
+            return;
+        }
+        float w0 = ringW;
+        int cx = (int) best[0];
+        int cy = (int) best[1];
+        int x0 = Math.max(0, (int) (cx - 0.8f * w0));
+        int x1 = Math.min(width - 1, (int) (cx + 0.8f * w0));
+        int measured = 0;
+        for (int y = Math.max(0, cy - 2); y <= Math.min(height - 1, cy + 2); y++) {
+            int left = -1;
+            int right = -1;
+            int base = y * width;
+            for (int x = x0; x <= x1; x++) {
+                if (greenMask[base + x] != 0) {
+                    if (left < 0) {
+                        left = x;
+                    }
+                    right = x;
+                }
+            }
+            // Beide Seiten des Rings müssen zu sehen sein
+            if (left >= 0 && left < cx - 0.3f * w0 && right > cx + 0.3f * w0) {
+                measured = Math.max(measured, right - left + 1);
             }
         }
-        sizeHistory.add(ringW * bestF);
-        if (sizeHistory.size() > SIZE_HISTORY) {
-            sizeHistory.remove(0);
+        if (measured <= 0 || measured < bootW * 0.75f || measured > bootW * 1.3f) {
+            return;
         }
-        // Nie weit von der zuerst gelernten Größe weglaufen
-        ringW = Math.max(bootW * 0.85f, Math.min(bootW * 1.2f, medianSize()));
+        sizeHistory.add((float) measured);
+        if (sizeHistory.size() >= SIZE_LOCK_SAMPLES) {
+            ringW = medianSize();
+            sizeLocked = true;
+        }
     }
+
+    private static final int SIZE_LOCK_SAMPLES = 9;   // so viele direkte Messungen, dann Größe fest
+    private boolean sizeLocked = false;
 
     // Größe noch unbekannt: Ring wie bisher über zusammenhängende Flecken finden
     // und dabei die Größe lernen (erst nach mehreren guten Messungen)
@@ -1062,6 +1178,7 @@ public class YoloDetector {
             if (sizeHistory.size() >= BOOT_SAMPLES) {
                 ringW = medianSize();
                 bootW = ringW;
+                sizeHistory.clear();   // ab jetzt zählen nur die direkten Breiten-Messungen
             }
         }
         return comp;
@@ -1074,6 +1191,7 @@ public class YoloDetector {
         if (ringW > 0f && nowMs - lastMatchTime > RING_RESET_MS) {
             ringW = 0f;
             bootW = 0f;
+            sizeLocked = false;
             sizeHistory.clear();
             ellOffsets = null;
             lastGoodRingW = 0f;
@@ -1166,6 +1284,44 @@ public class YoloDetector {
             }
         }
         return best;
+    }
+
+    // Gibt es eine sichere Erkennung einer anderen Klasse, die genau hier liegt und sicherer ist?
+    // (score = Gegner-Wert der Box; 1 = "immer prüfen", z. B. für verfolgte Boxen)
+    private boolean vetoedByOther(RectF box, float score) {
+        for (int i = 0; i < otherBoxes.size(); i++) {
+            float os = otherScores.get(i);
+            if (os < score && score < 1f) {
+                continue;
+            }
+            float limit = otherClasses.get(i) == ME_CLASS_ID ? VETO_IOU_ME : VETO_IOU;
+            if (calculateIoU(box, otherBoxes.get(i)) > limit) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Baut meine Box aus der KI-"Ich"-Box (Bildschirmpixel). Nur, wenn sie zu meiner letzten Position passt.
+    private RectF meBoxFromAi(RectF ai, float scaleX, float scaleY, long nowMs) {
+        float cxImg = ai.centerX() / scaleX;
+        float bottomImg = ai.bottom / scaleY;
+        float w = ringW > 0f ? ringW * RING_BOX_SCALE : ai.width() / scaleX;
+        float h = w / RING_ASPECT;
+        float ringCy = bottomImg - h * 0.5f;
+        // Zu weit weg von meiner letzten Position? Dann lieber nichts (vermutlich eine Verwechslung)
+        if (lastRingCx >= 0f && nowMs - lastMatchTime <= RING_LOCAL_MS && ringW > 0f
+                && Math.hypot(cxImg - lastRingCx, ringCy - lastRingCy) > ringW * AI_ME_MAX_JUMP) {
+            return null;
+        }
+        // Damit die Ring-Suche im nächsten Bild hier weitersucht
+        lastRingCx = cxImg;
+        lastRingCy = ringCy;
+        if (ringW > 0f) {
+            lastMatchTime = nowMs;
+        }
+        RectF ring = new RectF(cxImg - w * 0.5f, ringCy - h * 0.5f, cxImg + w * 0.5f, ringCy + h * 0.5f);
+        return boxFromRing(ring, scaleX, scaleY);
     }
 
     // Gegner-Box auf die feste Ringgröße bringen: Mitte und Fußhöhe kommen von der KI bzw. dem roten Ring,
@@ -1348,8 +1504,8 @@ public class YoloDetector {
             next.add(t);
         }
 
-        // 2) Verlorene, aber vorher sichere Gegner per Bildvergleich suchen
-        for (int i = 0; i < tracks.size(); i++) {
+        // 2) Verlorene, aber vorher sichere Gegner per Bildvergleich suchen (nur wenn eingeschaltet)
+        for (int i = 0; i < (TRACKING_ENABLED ? tracks.size() : 0); i++) {
             if (used[i]) {
                 continue;
             }
@@ -1362,8 +1518,9 @@ public class YoloDetector {
                 continue;
             }
             RectF out = new RectF(moved.left * scaleX, moved.top * scaleY, moved.right * scaleX, moved.bottom * scaleY);
-            // Nicht auf mich und nicht doppelt auf einen schon erkannten Gegner legen
-            boolean clash = meBox != null && calculateIoU(meBox, out) > 0.3f;
+            // Nicht auf mich, nicht auf etwas, das die KI sicher als etwas anderes erkennt
+            // (Teamkamerad, Ball ...), und nicht doppelt auf einen schon erkannten Gegner legen
+            boolean clash = (meBox != null && calculateIoU(meBox, out) > 0.3f) || vetoedByOther(out, 1f);
             for (RectF e : enemyOut) {
                 if (clash) {
                     break;
