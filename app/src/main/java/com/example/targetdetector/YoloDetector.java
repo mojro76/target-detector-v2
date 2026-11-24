@@ -41,6 +41,9 @@ public class YoloDetector {
     // KI-"Ich"-Box springt ein, wenn mein Ring gerade nicht zu sehen ist (Effekte, Busch, Gedränge)
     private static final float AI_ME_SCORE = 0.60f;
     private static final float AI_ME_MAX_JUMP = 3.0f;       // höchstens so viele Ringbreiten von meiner letzten Position
+    // Ist die KI sehr sicher, dass ich woanders bin als der gefundene Ring, gewinnt die KI.
+    // Messung: Eigene aufgestellte Objekte (z. B. Geschütz) haben auch einen grünen Ring.
+    private static final float AI_ME_OVERRIDE_SCORE = 0.70f;
     // Rote Ringe als zusätzliche Gegner: AUS. Messung: fast nur Fehl-Boxen auf orangen Kisten,
     // und die KI verpasst sichere Gegner so gut wie nie.
     private static final boolean RED_RINGS_ENABLED = false;
@@ -159,7 +162,11 @@ public class YoloDetector {
 
     private static final long KEEP_MS = 300;                 // so lange merkt sich die KI die letzten Boxen
     private static final float IOU_THRESHOLD = 0.45f;
-    private static final float MAX_BOX_RATIO = 0.20f; // Max. 20 % der Bildschirmbreite/-höhe
+    private static final float MAX_BOX_RATIO = 0.20f;   // Boxen höchstens 20 % der Bildschirmbreite breit ...
+    // ... und höchstens 32 % der Bildschirmhöhe hoch. Messung: Die KI-Boxen enthalten Name, Lebensbalken
+    // und (je nach Modus) Kopfgeld-Sterne und sind oft 220-290 px hoch. Mit 20 % (216 px) wurden fast alle
+    // "Ich"-Boxen und auf manchen Karten bis 40 % der Gegner und 60 % der Teamkameraden verworfen.
+    private static final float MAX_BOX_HEIGHT_RATIO = 0.32f;
     private static final float PAD_VALUE = 114f / 255f;
     private static final float INV_255 = 1f / 255f;
 
@@ -485,7 +492,7 @@ public class YoloDetector {
         float scaleToOutX = (float) outputWidth / width;
         float scaleToOutY = (float) outputHeight / height;
         float maxBoxWidth = outputWidth * MAX_BOX_RATIO;
-        float maxBoxHeight = outputHeight * MAX_BOX_RATIO;
+        float maxBoxHeight = outputHeight * MAX_BOX_HEIGHT_RATIO;
         List<Candidate> candidates = new ArrayList<>();
 
         int enemyChannel = 4 + TARGET_CLASS_ID;
@@ -605,7 +612,18 @@ public class YoloDetector {
         // "Ich" über den grünen Ring suchen (unabhängig von der KI)
         RectF meBox = null;
         lastMeFromAi = false;
-        RectF ring = findMeRing(width, height, pixelStride, rowStride, bufferLimit, nowMs);
+        RectF aiMeImg = (aiMe != null && aiMeScore >= AI_ME_SCORE)
+                ? new RectF(aiMe.left / scaleToOutX, aiMe.top / scaleToOutY,
+                        aiMe.right / scaleToOutX, aiMe.bottom / scaleToOutY)
+                : null;
+        RectF ring = findMeRing(width, height, pixelStride, rowStride, bufferLimit, nowMs, aiMeImg);
+        if (ring != null && aiMeImg != null && aiMeScore >= AI_ME_OVERRIDE_SCORE && ringW > 0f
+                && (Math.abs(ring.centerX() - aiMeImg.centerX()) > ringW * 0.6f
+                || Math.abs(ring.bottom - aiMeImg.bottom) > ringW * 1.0f)) {
+            // Ring und KI widersprechen sich deutlich: der Ring gehört zu etwas anderem
+            lastMatchTime = 0;   // damit die KI-Box nicht als "zu weit weg" verworfen wird
+            ring = null;
+        }
         if (ring != null) {
             meBox = boxFromRing(ring, scaleToOutX, scaleToOutY);
         } else if (aiMe != null && aiMeScore >= AI_ME_SCORE) {
@@ -1144,10 +1162,25 @@ public class YoloDetector {
 
     // Größe noch unbekannt: Ring wie bisher über zusammenhängende Flecken finden
     // und dabei die Größe lernen (erst nach mehreren guten Messungen)
-    private RectF bootstrapRing(int width, int height, int pixelStride, int rowStride, int limit, long nowMs) {
+    // aiMeImg: KI-"Ich"-Box in Bildpixeln (oder null). Ist sie da, wird nur ein Fleck genommen, der
+    // unter ihr liegt. Messung: Sonst wurde auf neuen Karten z. B. grün leuchtende Schrift genommen.
+    private RectF bootstrapRing(int width, int height, int pixelStride, int rowStride, int limit, long nowMs,
+                                RectF aiMeImg) {
         boolean hasLast = lastRingCx >= 0f && nowMs - lastRingTime <= RING_KEEP_MS;
-        RectF comp = pickMeRing(findRings(false, width, height, pixelStride, rowStride, limit),
-                hasLast, width, height);
+        List<Ring> rings = findRings(false, width, height, pixelStride, rowStride, limit);
+        if (aiMeImg != null) {
+            float aw = aiMeImg.width();
+            for (int i = rings.size() - 1; i >= 0; i--) {
+                RectF rb = rings.get(i).box;
+                boolean below = Math.abs(rb.centerX() - aiMeImg.centerX()) < aw * 0.35f
+                        && rb.centerY() > aiMeImg.bottom - aw * 0.8f
+                        && rb.centerY() < aiMeImg.bottom + aw * 0.3f;
+                if (!below) {
+                    rings.remove(i);
+                }
+            }
+        }
+        RectF comp = pickMeRing(rings, hasLast, width, height);
         lastRingScore = 0f;
         if (comp == null) {
             return null;
@@ -1185,7 +1218,8 @@ public class YoloDetector {
     }
 
     // Findet meinen Ring. Liefert die Ring-Umrandung (Bildpixel) oder null.
-    private RectF findMeRing(int width, int height, int pixelStride, int rowStride, int limit, long nowMs) {
+    private RectF findMeRing(int width, int height, int pixelStride, int rowStride, int limit, long nowMs,
+                             RectF aiMeImg) {
         frameCounter++;
         // Lange nichts gefunden (neue Runde, andere Karte): Größe neu lernen
         if (ringW > 0f && nowMs - lastMatchTime > RING_RESET_MS) {
@@ -1197,7 +1231,7 @@ public class YoloDetector {
             lastGoodRingW = 0f;
         }
         if (ringW <= 0f) {
-            return bootstrapRing(width, height, pixelStride, rowStride, limit, nowMs);
+            return bootstrapRing(width, height, pixelStride, rowStride, limit, nowMs, aiMeImg);
         }
 
         buildGreenMask(width, height, pixelStride, rowStride, limit);
@@ -1306,7 +1340,8 @@ public class YoloDetector {
     private RectF meBoxFromAi(RectF ai, float scaleX, float scaleY, long nowMs) {
         float cxImg = ai.centerX() / scaleX;
         float bottomImg = ai.bottom / scaleY;
-        float w = ringW > 0f ? ringW * RING_BOX_SCALE : ai.width() / scaleX;
+        // Größe noch nicht gelernt: Ring ist etwa 75 % so breit wie die KI-Box (gemessen)
+        float w = ringW > 0f ? ringW * RING_BOX_SCALE : ai.width() / scaleX * 0.75f;
         float h = w / RING_ASPECT;
         float ringCy = bottomImg - h * 0.5f;
         // Zu weit weg von meiner letzten Position? Dann lieber nichts (vermutlich eine Verwechslung)
