@@ -62,6 +62,9 @@ public class YoloDetector {
     private int[] syMap = new int[0];
     private byte[] frameBytes = new byte[0];
     private float[] rowFloats = new float[0];
+    private float[] rowR = new float[0];
+    private float[] rowG = new float[0];
+    private float[] rowB = new float[0];
 
     // 0 = unbekannt, 1 = normalisiert (0..1), 2 = Pixel
     private int coordMode = 0;
@@ -264,6 +267,11 @@ public class YoloDetector {
         if (rowFloats.length < scaledW * 3) {
             rowFloats = new float[scaledW * 3];
         }
+        if (rowR.length < scaledW) {
+            rowR = new float[scaledW];
+            rowG = new float[scaledW];
+            rowB = new float[scaledW];
+        }
 
         for (int y = 0; y < scaledH; y++) {
             int rowStart = syMap[y] * rowStride;
@@ -290,16 +298,26 @@ public class YoloDetector {
                 floatBufferView.position(rowIndex * 3);
                 floatBufferView.put(rowFloats, 0, scaledW * 3);
             } else {
+                // Modell mit getrennten Farbebenen (1, 3, H, W): erst ganze Zeile je Farbe sammeln,
+                // dann jede Zeile mit einem einzigen Befehl in den Eingabepuffer schreiben
                 for (int x = 0; x < scaledW; x++) {
                     int idx = rowStart + sxMap[x] * pixelStride;
-                    if (idx + 2 >= bufferLimit) {
-                        continue;
+                    if (idx + 2 < bufferLimit) {
+                        rowR[x] = (frameBytes[idx] & 0xFF) * INV_255;
+                        rowG[x] = (frameBytes[idx + 1] & 0xFF) * INV_255;
+                        rowB[x] = (frameBytes[idx + 2] & 0xFF) * INV_255;
+                    } else {
+                        rowR[x] = PAD_VALUE;
+                        rowG[x] = PAD_VALUE;
+                        rowB[x] = PAD_VALUE;
                     }
-                    int pixelIndex = rowIndex + x;
-                    floatBufferView.put(pixelIndex, (frameBytes[idx] & 0xFF) * INV_255);
-                    floatBufferView.put(planeSize + pixelIndex, (frameBytes[idx + 1] & 0xFF) * INV_255);
-                    floatBufferView.put(2 * planeSize + pixelIndex, (frameBytes[idx + 2] & 0xFF) * INV_255);
                 }
+                floatBufferView.position(rowIndex);
+                floatBufferView.put(rowR, 0, scaledW);
+                floatBufferView.position(planeSize + rowIndex);
+                floatBufferView.put(rowG, 0, scaledW);
+                floatBufferView.position(2 * planeSize + rowIndex);
+                floatBufferView.put(rowB, 0, scaledW);
             }
         }
 
@@ -491,4 +509,4 @@ public class YoloDetector {
     public synchronized void close() {
         closeInterpreter();
     }
-}
+            }
