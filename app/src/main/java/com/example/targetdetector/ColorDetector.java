@@ -11,7 +11,8 @@ public class ColorDetector {
     public enum TargetType {
         PLAYER,
         TEAMMATE,
-        ENEMY
+        ENEMY,
+        ME
     }
 
     public static class Detection {
