@@ -450,4 +450,4 @@ public class YoloDetector {
     public synchronized void close() {
         closeInterpreter();
     }
-    }
+}
