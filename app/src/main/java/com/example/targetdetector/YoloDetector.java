@@ -450,7 +450,7 @@ public class YoloDetector {
 
         // Eigene Position (Me) am Ende anfügen, damit bestehende Zugriffe auf Enemy zuerst kommen
         if (bestMeBox != null) {
-            results.add(new ColorDetector.Detection(bestMeBox, ColorDetector.TargetType.ME));
+            results.add(new ColorDetector.Detection(bestMeBox, ColorDetector.TargetType.PLAYER));
         }
 
         // Enemy-Boxen dieses Bildes für das nächste Bild merken
@@ -512,4 +512,46 @@ public class YoloDetector {
         float boxWidth = right - left;
         float boxHeight = bottom - top;
         if (boxWidth <= 0f || boxHeight <= 0f
-                || boxWidth > maxBoxWidth || box
+                || boxWidth > maxBoxWidth || boxHeight > maxBoxHeight) {
+            return null;
+        }
+        return new RectF(left, top, right, bottom);
+    }
+
+    private boolean nearPreviousBox(RectF box) {
+        for (RectF previous : lastBoxes) {
+            if (calculateIoU(box, previous) > 0.2f) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private float getOut(int channel, int boxIndex) {
+        if (isOutputChannelsFirst) {
+            return outputBuffer[0][channel][boxIndex];
+        } else {
+            return outputBuffer[0][boxIndex][channel];
+        }
+    }
+
+    private float calculateIoU(RectF a, RectF b) {
+        float interLeft = Math.max(a.left, b.left);
+        float interTop = Math.max(a.top, b.top);
+        float interRight = Math.min(a.right, b.right);
+        float interBottom = Math.min(a.bottom, b.bottom);
+
+        float interW = Math.max(0f, interRight - interLeft);
+        float interH = Math.max(0f, interBottom - interTop);
+        float interArea = interW * interH;
+
+        float areaA = Math.max(0f, a.width()) * Math.max(0f, a.height());
+        float areaB = Math.max(0f, b.width()) * Math.max(0f, b.height());
+        float union = areaA + areaB - interArea;
+        return union > 0f ? interArea / union : 0f;
+    }
+
+    public synchronized void close() {
+        closeInterpreter();
+    }
+}
