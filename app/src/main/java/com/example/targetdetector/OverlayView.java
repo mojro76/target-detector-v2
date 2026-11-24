@@ -21,6 +21,10 @@ public class OverlayView extends View {
     private static final long HOLD_MS = 120;
     // Ab dieser Überlappung gelten zwei Boxen als derselbe Gegner
     private static final float DUPLICATE_IOU = 0.3f;
+    // Größenänderungen unter 15 % werden ignoriert (gegen Pumpen der Box)
+    private static final float SIZE_TOLERANCE = 0.15f;
+    // Positionsänderungen unter 8 Pixel werden ignoriert (gegen Zittern)
+    private static final float CENTER_DEADZONE_PX = 8f;
 
     private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint textPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
@@ -32,7 +36,7 @@ public class OverlayView extends View {
         super(context);
 
         paint.setStyle(Paint.Style.STROKE);
-        paint.setStrokeWidth(6f);
+        paint.setStrokeWidth(4f);
 
         textPaint.setColor(Color.YELLOW);
         textPaint.setTextSize(42f);
@@ -45,14 +49,74 @@ public class OverlayView extends View {
             debugText = status;
             long now = SystemClock.uptimeMillis();
             if (!filtered.isEmpty()) {
-                // Neue Boxen sofort übernehmen, ohne Verzögerung
-                detections = filtered;
+                // Neue Boxen sofort übernehmen, nur Mini-Schwankungen werden geschluckt
+                detections = stabilize(filtered, detections);
                 lastHitTime = now;
             } else if (now - lastHitTime > HOLD_MS) {
                 detections = filtered;
             }
             invalidate();
         });
+    }
+
+    // Vergleicht jede neue Box mit der passenden Box vom letzten Mal.
+    // Kleine Änderungen bei Größe und Position werden ignoriert, große sofort übernommen.
+    private List<ColorDetector.Detection> stabilize(
+            List<ColorDetector.Detection> fresh,
+            List<ColorDetector.Detection> previous
+    ) {
+        List<ColorDetector.Detection> result = new ArrayList<>();
+        boolean[] used = new boolean[previous.size()];
+
+        for (ColorDetector.Detection d : fresh) {
+            float dcx = d.box.centerX();
+            float dcy = d.box.centerY();
+            float dw = d.box.width();
+            float dh = d.box.height();
+
+            // Passende alte Box suchen (gleiche Art, Mitte nah genug)
+            int best = -1;
+            float bestDist = Float.MAX_VALUE;
+            for (int i = 0; i < previous.size(); i++) {
+                ColorDetector.Detection p = previous.get(i);
+                if (used[i] || p.type != d.type) {
+                    continue;
+                }
+                float dist = (float) Math.hypot(dcx - p.box.centerX(), dcy - p.box.centerY());
+                float gate = Math.max(p.box.width(), p.box.height()) * 0.6f;
+                if (dist < gate && dist < bestDist) {
+                    best = i;
+                    bestDist = dist;
+                }
+            }
+
+            if (best < 0) {
+                result.add(d);
+                continue;
+            }
+            used[best] = true;
+            RectF p = previous.get(best).box;
+
+            float cx = dcx;
+            float cy = dcy;
+            if (bestDist < CENTER_DEADZONE_PX) {
+                cx = p.centerX();
+                cy = p.centerY();
+            }
+
+            float w = dw;
+            float h = dh;
+            if (p.width() > 0f && Math.abs(dw - p.width()) / p.width() < SIZE_TOLERANCE) {
+                w = p.width();
+            }
+            if (p.height() > 0f && Math.abs(dh - p.height()) / p.height() < SIZE_TOLERANCE) {
+                h = p.height();
+            }
+
+            RectF box = new RectF(cx - w / 2f, cy - h / 2f, cx + w / 2f, cy + h / 2f);
+            result.add(new ColorDetector.Detection(box, d.type));
+        }
+        return result;
     }
 
     // Die KI liefert die sicherste Box zuerst. Jede weitere Box, die stark mit einer
