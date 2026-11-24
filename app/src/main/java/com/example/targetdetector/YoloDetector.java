@@ -26,18 +26,36 @@ public class YoloDetector {
     private static final String TAG = "YoloDetector";
     private static final String MODEL_FILE = "best.tflite";
     private static final int TARGET_CLASS_ID = 1; // 1 = Enemy
-    private static final int ME_CLASS_ID = 5;     // 5 = Me
     private static final float CONFIDENCE_THRESHOLD = 0.25f; // neue Enemy-Boxen brauchen mindestens diesen Wert
     private static final float LOW_THRESHOLD = 0.12f;        // schon bekannte Enemy-Boxen dürfen bis hierher fallen
-    private static final float ME_CONFIDENCE_THRESHOLD = 0.22f; // neue Me-Box braucht mindestens diesen Wert
-    private static final float ME_LOW_THRESHOLD = 0.10f;        // schon bekannte Me-Box darf bis hierher fallen
-    private static final float ME_CENTRAL_THRESHOLD = 0.15f;   // in der Bildmitte reicht ein niedrigerer Wert
-    private static final float ME_CENTER_Y = 0.55f;             // Figur steht meist etwas unter der Mitte
-    private static final float ME_CENTER_RADIUS = 0.35f;        // so weit reicht der Mitte-Bonus
-    private static final float ME_CENTER_BONUS = 0.20f;
-    private static final long ME_KEEP_MS = 800;
-    private RectF lastMeBox = null;
-    private long lastMeTime = 0;
+
+    // ===== "Ich" über den grünen Ring unter meiner Figur finden =====
+    // Suchbereich (Anteil vom Bild): oben ist HUD, unten rechts sind die grünen Knöpfe
+    private static final float RING_X_MIN = 0.08f;
+    private static final float RING_X_MAX = 0.92f;
+    private static final float RING_Y_MIN = 0.18f;
+    private static final float RING_Y_MAX = 0.97f;
+    private static final float UI_X = 0.65f;   // rechts davon UND ...
+    private static final float UI_Y = 0.62f;   // ... unterhalb davon wird nicht gesucht (Knöpfe)
+    // Form des Rings (Anteil von Bildbreite/-höhe)
+    private static final float RING_MIN_W = 0.030f;
+    private static final float RING_MAX_W = 0.066f;    // Ring ist im Spiel immer etwa gleich groß; größere grüne Flächen (z. B. Spielfeldlinien) fliegen raus
+    private static final float RING_MIN_H = 0.045f;    // Lebensbalken und Name sind flacher -> fliegen raus
+    private static final float RING_MIN_ASPECT = 0.7f;
+    private static final float RING_MAX_ASPECT = 4.2f;
+    private static final int RING_MIN_PIXELS = 20;
+    private static final float RING_MAX_INNER_FILL = 0.45f; // höchstens so viel Grün innen im Ring
+    // Aus dem Ring wird die Box meiner Figur gebaut: so hoch wie 1,5 x Ringbreite
+    private static final float ME_BOX_HEIGHT = 1.5f;
+    private static final long RING_KEEP_MS = 500;
+
+    private byte[] ringMask = new byte[0];
+    private int[] ringStack = new int[0];
+    private float lastRingCx = -1f;
+    private float lastRingCy = -1f;
+    private long lastRingTime = 0;
+    private int lastRingPixels = 0;
+
     private static final long KEEP_MS = 300;                 // so lange merkt sich die KI die letzten Boxen
     private static final float IOU_THRESHOLD = 0.45f;
     private static final float MAX_BOX_RATIO = 0.20f; // Max. 20 % der Bildschirmbreite/-höhe
@@ -248,7 +266,7 @@ public class YoloDetector {
     ) {
         List<ColorDetector.Detection> results = new ArrayList<>();
         ensureInitialized();
-        int requiredChannel = 4 + Math.max(TARGET_CLASS_ID, ME_CLASS_ID);
+        int requiredChannel = 4 + TARGET_CLASS_ID;
         if (interpreter == null || outputBuffer == null || buffer == null
                 || width <= 0 || height <= 0 || numChannels <= requiredChannel) {
             if (interpreter != null && numChannels <= requiredChannel) {
@@ -370,18 +388,11 @@ public class YoloDetector {
         List<Candidate> candidates = new ArrayList<>();
 
         int enemyChannel = 4 + TARGET_CLASS_ID;
-        int meChannel = 4 + ME_CLASS_ID;
         float enemyMax = 0f;
-        RectF bestMeBox = null;
-        float bestMeEff = 0f; // Me-Wert inkl. Bonus für Nähe zur letzten Position
-        float bestMeScore = 0f;
 
         long nowMs = tStart / 1_000_000;
         if (nowMs - lastBoxesTime > KEEP_MS) {
             lastBoxes.clear();
-        }
-        if (nowMs - lastMeTime > ME_KEEP_MS) {
-            lastMeBox = null;
         }
 
         for (int i = 0; i < numBoxes; i++) {
@@ -390,70 +401,29 @@ public class YoloDetector {
             if (enemyScore > enemyMax) {
                 enemyMax = enemyScore;
             }
-            float meScore = getOut(meChannel, i);
-
-            boolean checkEnemy = enemyScore >= LOW_THRESHOLD;
-            boolean checkMe = meScore >= ME_LOW_THRESHOLD;
-            if (!checkEnemy && !checkMe) {
+            if (enemyScore < LOW_THRESHOLD) {
                 continue;
             }
 
-            RectF decodedBox = null;
-
-            if (checkEnemy) {
-                boolean strong = enemyScore >= CONFIDENCE_THRESHOLD;
-                float bestOther = 0f;
-                for (int c = 4; c < numChannels; c++) {
-                    if (c != enemyChannel) {
-                        float v = getOut(c, i);
-                        if (v > bestOther) {
-                            bestOther = v;
-                        }
-                    }
-                }
-                // Neue Boxen: Enemy muss klar die beste Klasse sein.
-                // Schwache Boxen (schon bekannt): Enemy darf knapp hinter der besten Klasse liegen.
-                if (!(strong ? bestOther > enemyScore : bestOther > enemyScore * 1.25f)) {
-                    decodedBox = decodeBox(i, normalized, scaleToOutX, scaleToOutY,
-                            outputWidth, outputHeight, maxBoxWidth, maxBoxHeight);
-                    if (decodedBox != null && (strong || nearPreviousBox(decodedBox))) {
-                        candidates.add(new Candidate(decodedBox, enemyScore));
+            boolean strong = enemyScore >= CONFIDENCE_THRESHOLD;
+            float bestOther = 0f;
+            for (int c = 4; c < numChannels; c++) {
+                if (c != enemyChannel) {
+                    float v = getOut(c, i);
+                    if (v > bestOther) {
+                        bestOther = v;
                     }
                 }
             }
-
-            if (checkMe) {
-                if (decodedBox == null) {
-                    decodedBox = decodeBox(i, normalized, scaleToOutX, scaleToOutY,
-                            outputWidth, outputHeight, maxBoxWidth, maxBoxHeight);
-                }
-                if (decodedBox != null) {
-                    // Ich bin fast immer nah an der Bildschirmmitte und dort, wo ich zuletzt war.
-                    // Beides gibt Bonuspunkte, damit ein Teamkamerad am Rand nicht gewinnt.
-                    float central = centerBonus(decodedBox, outputWidth, outputHeight);
-                    boolean near = nearLastMe(decodedBox);
-                    boolean likelyMe = near || central > 0.10f;
-
-                    // Je wahrscheinlicher "ich", desto mehr darf eine andere Klasse vorne liegen
-                    float tolerance = likelyMe ? 1.6f : 1.1f;
-                    boolean meIsBest = true;
-                    for (int c = 4; c < numChannels; c++) {
-                        if (c != meChannel && getOut(c, i) > meScore * tolerance) {
-                            meIsBest = false;
-                            break;
-                        }
-                    }
-
-                    boolean accepted = meScore >= ME_CONFIDENCE_THRESHOLD
-                            || near
-                            || (central > 0.10f && meScore >= ME_CENTRAL_THRESHOLD);
-                    float eff = meScore + (near ? 0.2f : 0f) + central;
-                    if (meIsBest && accepted && eff > bestMeEff) {
-                        bestMeEff = eff;
-                        bestMeScore = meScore;
-                        bestMeBox = decodedBox;
-                    }
-                }
+            // Neue Boxen: Enemy muss klar die beste Klasse sein.
+            // Schwache Boxen (schon bekannt): Enemy darf knapp hinter der besten Klasse liegen.
+            if (strong ? bestOther > enemyScore : bestOther > enemyScore * 1.25f) {
+                continue;
+            }
+            RectF decodedBox = decodeBox(i, normalized, scaleToOutX, scaleToOutY,
+                    outputWidth, outputHeight, maxBoxWidth, maxBoxHeight);
+            if (decodedBox != null && (strong || nearPreviousBox(decodedBox))) {
+                candidates.add(new Candidate(decodedBox, enemyScore));
             }
         }
 
@@ -473,22 +443,22 @@ public class YoloDetector {
             }
         }
 
-        // Eigene Position (Me) am Ende anfügen, damit bestehende Zugriffe auf Enemy zuerst kommen
-        // Gegner und "Ich" dürfen nicht dieselbe Figur sein: bei Überlappung gewinnt der höhere Wert
-        if (bestMeBox != null) {
+        // "Ich" über den grünen Ring suchen (unabhängig von der KI)
+        RectF meBox = null;
+        RectF ring = findMeRing(width, height, pixelStride, rowStride, bufferLimit, nowMs);
+        if (ring != null) {
+            float w = ring.width();
+            float cx = ring.centerX();
+            float left = (cx - w * 0.5f) * scaleToOutX;
+            float right = (cx + w * 0.5f) * scaleToOutX;
+            float bottom = ring.bottom * scaleToOutY;
+            float top = (ring.bottom - w * ME_BOX_HEIGHT) * scaleToOutY;
+            meBox = new RectF(left, Math.max(0f, top), right, bottom);
+
+            // Hält die KI mich selbst für einen Gegner, wird diese Gegner-Box entfernt
             for (int k = kept.size() - 1; k >= 0; k--) {
-                RectF eb = kept.get(k).box;
-                boolean same = calculateIoU(bestMeBox, eb) > 0.25f
-                        || eb.contains(bestMeBox.centerX(), bestMeBox.centerY())
-                        || bestMeBox.contains(eb.centerX(), eb.centerY());
-                if (!same) {
-                    continue;
-                }
-                if (bestMeScore >= kept.get(k).score) {
-                    kept.remove(k);   // das war in Wahrheit ich
-                } else {
-                    bestMeBox = null; // das ist ein Gegner, nicht ich
-                    break;
+                if (calculateIoU(meBox, kept.get(k).box) > 0.4f) {
+                    kept.remove(k);
                 }
             }
         }
@@ -496,11 +466,8 @@ public class YoloDetector {
         for (Candidate k : kept) {
             results.add(new ColorDetector.Detection(k.box, ColorDetector.TargetType.ENEMY));
         }
-
-        if (bestMeBox != null) {
-            lastMeBox = bestMeBox;
-            lastMeTime = nowMs;
-            results.add(new ColorDetector.Detection(bestMeBox, ColorDetector.TargetType.PLAYER));
+        if (meBox != null) {
+            results.add(new ColorDetector.Detection(meBox, ColorDetector.TargetType.PLAYER));
         }
 
         // Enemy-Boxen dieses Bildes für das nächste Bild merken
@@ -515,14 +482,14 @@ public class YoloDetector {
         long tEnd = System.nanoTime();
         lastDebug = String.format(
                 Locale.US,
-                "%s Kopie:%d Umr:%d Modell:%d Nach:%d ms | Enemy:%.2f Me:%.2f",
+                "%s Kopie:%d Umr:%d Modell:%d Nach:%d ms | Enemy:%.2f Ring:%d",
                 usingGpu ? "GPU" : "CPU",
                 (tCopy - tStart) / 1_000_000,
                 (tPre - tCopy) / 1_000_000,
                 (tRun - tPre) / 1_000_000,
                 (tEnd - tRun) / 1_000_000,
                 enemyMax,
-                bestMeBox != null ? bestMeScore : 0f
+                lastRingPixels
         );
 
         return results;
@@ -569,16 +536,158 @@ public class YoloDetector {
         return new RectF(left, top, right, bottom);
     }
 
-    // 0 am Rand, bis ME_CENTER_BONUS in der Bildmitte
-    private float centerBonus(RectF box, int outW, int outH) {
-        float dx = box.centerX() / outW - 0.5f;
-        float dy = box.centerY() / outH - ME_CENTER_Y;
-        float dist = (float) Math.hypot(dx, dy);
-        return ME_CENTER_BONUS * Math.max(0f, 1f - dist / ME_CENTER_RADIUS);
+    // Helles Grün des eigenen Rings. Büsche haben fast kein Rot (R < 40), Teamkameraden sind blau, Gegner rot
+    private static boolean isRingGreen(int r, int g, int b) {
+        return r >= 40 && r <= 210 && g >= 150 && g - r >= 70 && g - b >= 70;
     }
 
-    private boolean nearLastMe(RectF box) {
-        return lastMeBox != null && calculateIoU(box, lastMeBox) > 0.2f;
+    // Ein Ring ist innen größtenteils nicht grün (dort stehe ich). Ein Busch ist innen voll grün.
+    private boolean isHollow(int minX, int minY, int maxX, int maxY, int width) {
+        int w = maxX - minX + 1;
+        int h = maxY - minY + 1;
+        int ix0 = minX + (int) (w * 0.3f);
+        int ix1 = maxX - (int) (w * 0.3f);
+        int iy0 = minY + (int) (h * 0.3f);
+        int iy1 = maxY - (int) (h * 0.3f);
+        int total = 0;
+        int green = 0;
+        for (int y = iy0; y <= iy1; y++) {
+            for (int x = ix0; x <= ix1; x++) {
+                total++;
+                if (ringMask[y * width + x] != 0) {
+                    green++;
+                }
+            }
+        }
+        return total > 0 && green < total * RING_MAX_INNER_FILL;
+    }
+
+    // Sucht den grünen Ring unter meiner Figur. Liefert seine Umrandung in Bildpixeln oder null.
+    private RectF findMeRing(int width, int height, int pixelStride, int rowStride, int limit, long nowMs) {
+        int n = width * height;
+        if (ringMask.length < n) {
+            ringMask = new byte[n];
+            ringStack = new int[n];
+        }
+
+        int x0 = (int) (width * RING_X_MIN);
+        int x1 = (int) (width * RING_X_MAX);
+        int y0 = (int) (height * RING_Y_MIN);
+        int y1 = (int) (height * RING_Y_MAX);
+        int uiX = (int) (width * UI_X);
+        int uiY = (int) (height * UI_Y);
+
+        // Schritt 1: alle hellgrünen Pixel markieren
+        for (int y = y0; y < y1; y++) {
+            int rowStart = y * rowStride;
+            int base = y * width;
+            for (int x = x0; x < x1; x++) {
+                byte m = 0;
+                if (!(x > uiX && y > uiY)) {
+                    int idx = rowStart + x * pixelStride;
+                    if (idx + 2 < limit) {
+                        int r = frameBytes[idx] & 0xFF;
+                        int g = frameBytes[idx + 1] & 0xFF;
+                        int b = frameBytes[idx + 2] & 0xFF;
+                        if (isRingGreen(r, g, b)) {
+                            m = 1;
+                        }
+                    }
+                }
+                ringMask[base + x] = m;
+            }
+        }
+
+        boolean hasLast = lastRingCx >= 0f && nowMs - lastRingTime <= RING_KEEP_MS;
+        float minW = width * RING_MIN_W;
+        float maxW = width * RING_MAX_W;
+        float minH = height * RING_MIN_H;
+
+        RectF best = null;
+        float bestScore = 0f;
+        int bestPixels = 0;
+
+        // Schritt 2: zusammenhängende grüne Flecken finden und den ringförmigsten nehmen
+        for (int y = y0; y < y1; y++) {
+            for (int x = x0; x < x1; x++) {
+                int start = y * width + x;
+                if (ringMask[start] != 1) {
+                    continue;
+                }
+                int sp = 0;
+                ringStack[sp++] = start;
+                ringMask[start] = 2;
+                int minX = x, maxX = x, minY = y, maxY = y, count = 0;
+
+                while (sp > 0) {
+                    int p = ringStack[--sp];
+                    int px = p % width;
+                    int py = p / width;
+                    count++;
+                    if (px < minX) minX = px;
+                    if (px > maxX) maxX = px;
+                    if (py < minY) minY = py;
+                    if (py > maxY) maxY = py;
+
+                    for (int dy = -1; dy <= 1; dy++) {
+                        int ny = py + dy;
+                        if (ny < y0 || ny >= y1) {
+                            continue;
+                        }
+                        for (int dx = -1; dx <= 1; dx++) {
+                            int nx = px + dx;
+                            if (nx < x0 || nx >= x1) {
+                                continue;
+                            }
+                            int q = ny * width + nx;
+                            if (ringMask[q] == 1) {
+                                ringMask[q] = 2;
+                                ringStack[sp++] = q;
+                            }
+                        }
+                    }
+                }
+
+                float w = maxX - minX + 1;
+                float h = maxY - minY + 1;
+                float aspect = w / h;
+                if (count < RING_MIN_PIXELS || w < minW || w > maxW || h < minH
+                        || aspect < RING_MIN_ASPECT || aspect > RING_MAX_ASPECT) {
+                    continue;
+                }
+
+                float cx = (minX + maxX) * 0.5f;
+                float cy = (minY + maxY) * 0.5f;
+
+                // Ring muss innen hohl sein, sonst ist es ein Busch o. Ä.
+                if (!isHollow(minX, minY, maxX, maxY, width)) {
+                    continue;
+                }
+                float score = count;
+                // Nah an der letzten Ring-Position: sehr wahrscheinlich wieder ich
+                if (hasLast && Math.hypot(cx - lastRingCx, cy - lastRingCy) < w) {
+                    score *= 3f;
+                }
+                // Etwas Vorrang für die Bildmitte (Kamera folgt mir)
+                float dxc = cx / width - 0.5f;
+                float dyc = cy / height - 0.55f;
+                score *= 1.5f - Math.min(1f, (float) Math.hypot(dxc, dyc));
+
+                if (score > bestScore) {
+                    bestScore = score;
+                    bestPixels = count;
+                    best = new RectF(minX, minY, maxX + 1, maxY + 1);
+                }
+            }
+        }
+
+        if (best != null) {
+            lastRingCx = best.centerX();
+            lastRingCy = best.centerY();
+            lastRingTime = nowMs;
+        }
+        lastRingPixels = bestPixels;
+        return best;
     }
 
     private boolean nearPreviousBox(RectF box) {
