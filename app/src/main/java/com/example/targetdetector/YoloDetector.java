@@ -61,7 +61,8 @@ public class YoloDetector {
     private static final float GREEN_CENTER_X_MIN = 0.12f;
     private static final float GREEN_CENTER_X_MAX = 0.81f;
     private static final float RING_MIN_W = 0.030f;
-    private static final float RING_MAX_W = 0.060f;    // Ring ist im Spiel immer etwa gleich groß; größere grüne Flächen (z. B. Spielfeldlinien) fliegen raus
+    private static final float RING_MAX_W = 0.075f;    // größte erlaubte Ringbreite (nur nahe meiner letzten Position)
+    private static final float RING_MAX_W_NEW = 0.060f; // ohne Vorwissen strenger: größere grüne Flächen (z. B. Spielfeldlinien) fliegen raus
     private static final float RING_MIN_H = 0.055f;    // Lebensbalken und Name sind flacher -> fliegen raus
     private static final float RING_MIN_ASPECT = 0.7f;
     private static final float RING_MAX_ASPECT = 4.2f;
@@ -896,8 +897,13 @@ public class YoloDetector {
             }
             float cx = ring.box.centerX();
             float cy = ring.box.centerY();
+            boolean nearLast = hasLast && Math.hypot(cx - lastRingCx, cy - lastRingCy) < ring.box.width();
+            // Große Ringe (z. B. Fußball-Karte, Kamera näher dran) nur dort, wo ich eben noch war
+            if (!weakMode && !nearLast && ring.box.width() > width * RING_MAX_W_NEW) {
+                continue;
+            }
             float score = ring.pixels;
-            if (hasLast && Math.hypot(cx - lastRingCx, cy - lastRingCy) < ring.box.width()) {
+            if (nearLast) {
                 score *= 3f;
             }
             float dxc = cx / width - 0.5f;
