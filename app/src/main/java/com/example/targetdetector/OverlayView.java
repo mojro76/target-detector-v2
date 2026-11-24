@@ -13,9 +13,11 @@ import java.util.List;
 
 public class OverlayView extends View {
 
-    private static final int COLOR_PLAYER = Color.rgb(120, 255, 120);  // grün = ich
+    // Farben so gewählt, dass die Ring-Suche im YoloDetector die eigenen Ecken NICHT als Ring sieht
+    // (auch nicht an den Kanten, wo sich die Farbe mit Busch/Boden mischt). Auf Screenshots getestet.
+    private static final int COLOR_PLAYER = Color.rgb(0, 200, 255);    // türkis-blau = ich
     private static final int COLOR_TEAMMATE = Color.rgb(155, 190, 255);
-    private static final int COLOR_ENEMY = Color.rgb(255, 110, 110);
+    private static final int COLOR_ENEMY = Color.rgb(255, 60, 255);    // pink-lila = Gegner
     private static final int COLOR_AIM_LINE = Color.rgb(255, 190, 40); // gelb-orange
 
     // Verliert die KI einen Gegner kurz (z. B. beim Treffer-Effekt), bleibt seine Box so lange stehen
@@ -427,7 +429,7 @@ public class OverlayView extends View {
             canvas.drawText(debugText, 40f, 100f, textPaint);
         }
 
-        // Gegner (rot) und Teamkameraden (blau)
+        // Gegner (pink-lila) und Teamkameraden (blau)
         for (ColorDetector.Detection detection : detections) {
             if (detection.type == ColorDetector.TargetType.TEAMMATE) {
                 paint.setColor(COLOR_TEAMMATE);
@@ -440,7 +442,7 @@ public class OverlayView extends View {
 
         long now = SystemClock.uptimeMillis();
 
-        // Grüne Box um mich
+        // Türkis-blaue Box um mich
         if (meValid(now)) {
             paint.setColor(COLOR_PLAYER);
             paint.setAlpha(CORNER_ALPHA);
