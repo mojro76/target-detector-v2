@@ -18,19 +18,23 @@ public class OverlayView extends View {
     private static final int COLOR_ENEMY = Color.rgb(255, 155, 155);
 
     // Einstellungen für das flüssige Mitlaufen
-    private static final long HOLD_MS = 250;              // so lange bleibt eine verpasste Box stehen
-    private static final float LATENCY_MS = 60f;          // geschätzte Verzögerung der KI (Vorausschau)
-    private static final float MAX_EXTRAPOLATION_MS = 200f; // so weit wird höchstens vorausgerechnet
-    private static final float MAX_SPEED = 2.0f;          // max. Geschwindigkeit in Pixel pro ms
-    private static final float POS_SMOOTH_MS = 35f;       // Weichheit der Bewegung
-    private static final float SIZE_SMOOTH_MS = 90f;      // Weichheit der Boxgröße
+    private static final long HOLD_MS = 250;                // so lange bleibt eine verpasste Box stehen
+    private static final float LATENCY_MS = 40f;            // geschätzte Verzögerung der KI (Vorausschau)
+    private static final float MAX_EXTRAPOLATION_MS = 150f; // so weit wird höchstens vorausgerechnet
+    private static final float MAX_OFFSET_RATIO = 0.6f;     // Vorausschau höchstens 60 % der Boxgröße
+    private static final float MAX_SPEED = 2.0f;            // max. Geschwindigkeit in Pixel pro ms
+    private static final float MIN_SPEED = 0.08f;           // darunter gilt der Gegner als stehend
+    private static final float MIN_DEADZONE_PX = 10f;       // kleinere Bewegungen werden ignoriert
+    private static final float DEADZONE_RATIO = 0.10f;      // ... oder 10 % der Boxgröße
+    private static final float POS_SMOOTH_MS = 40f;         // Weichheit der Bewegung
+    private static final float SIZE_SMOOTH_MS = 90f;        // Weichheit der Boxgröße
 
     private static class Track {
         ColorDetector.TargetType type;
         float cx, cy, w, h;         // gezeichnete Box (Mitte und Größe)
         float mcx, mcy, mw, mh;     // letzte Messung der KI
         float vx, vy;               // Geschwindigkeit in Pixel pro ms
-        long measTime;              // Zeitpunkt der letzten Messung
+        long measTime;              // Zeitpunkt, an dem sich die Position zuletzt wirklich geändert hat
         long lastSeen;              // Zeitpunkt, an dem die KI die Box zuletzt gesehen hat
     }
 
@@ -93,18 +97,36 @@ public class OverlayView extends View {
             if (best >= 0) {
                 used[best] = true;
                 Track t = tracks.get(best);
-                float dt = now - t.measTime;
-                if (dt >= 15f) {
-                    float rvx = clamp((dcx - t.mcx) / dt, -MAX_SPEED, MAX_SPEED);
-                    float rvy = clamp((dcy - t.mcy) / dt, -MAX_SPEED, MAX_SPEED);
-                    t.vx = 0.5f * t.vx + 0.5f * rvx;
-                    t.vy = 0.5f * t.vy + 0.5f * rvy;
+
+                float moved = (float) Math.hypot(dcx - t.mcx, dcy - t.mcy);
+                float dead = Math.max(MIN_DEADZONE_PX, DEADZONE_RATIO * Math.max(t.mw, t.mh));
+
+                if (moved < dead) {
+                    // Gegner steht praktisch still: Position nicht anfassen, Geschwindigkeit abbauen
+                    t.vx *= 0.5f;
+                    t.vy *= 0.5f;
+                } else {
+                    float dt = now - t.measTime;
+                    if (dt >= 15f) {
+                        float rvx = clamp((dcx - t.mcx) / dt, -MAX_SPEED, MAX_SPEED);
+                        float rvy = clamp((dcy - t.mcy) / dt, -MAX_SPEED, MAX_SPEED);
+                        t.vx = 0.65f * t.vx + 0.35f * rvx;
+                        t.vy = 0.65f * t.vy + 0.35f * rvy;
+                    }
+                    t.mcx = dcx;
+                    t.mcy = dcy;
+                    t.measTime = now;
                 }
-                t.mcx = dcx;
-                t.mcy = dcy;
-                t.mw = dw;
-                t.mh = dh;
-                t.measTime = now;
+
+                // Sehr kleine Geschwindigkeiten sind nur Rauschen
+                if (Math.hypot(t.vx, t.vy) < MIN_SPEED) {
+                    t.vx = 0f;
+                    t.vy = 0f;
+                }
+
+                // Größe ruhig nachführen
+                t.mw += (dw - t.mw) * 0.4f;
+                t.mh += (dh - t.mh) * 0.4f;
                 t.lastSeen = now;
             } else {
                 Track t = new Track();
@@ -158,8 +180,11 @@ public class OverlayView extends View {
         for (Track t : tracks) {
             // Wohin bewegt sich der Gegner gerade? (letzte Messung + Geschwindigkeit + KI-Verzögerung)
             float el = Math.min((now - t.measTime) + LATENCY_MS, MAX_EXTRAPOLATION_MS);
-            float tx = t.mcx + t.vx * el;
-            float ty = t.mcy + t.vy * el;
+            float limit = MAX_OFFSET_RATIO * Math.max(t.mw, t.mh);
+            float ox = clamp(t.vx * el, -limit, limit);
+            float oy = clamp(t.vy * el, -limit, limit);
+            float tx = t.mcx + ox;
+            float ty = t.mcy + oy;
 
             // Gezeichnete Box gleitet weich zum Ziel
             t.cx += (tx - t.cx) * posA;
@@ -188,4 +213,4 @@ public class OverlayView extends View {
 
         postInvalidateOnAnimation();
     }
-}
+                       }
