@@ -58,7 +58,7 @@ public class YoloDetector {
     private int padY = 0;
     private int[] sxMap = new int[0];
     private int[] syMap = new int[0];
-    private byte[] rowBytes = new byte[0];
+    private byte[] frameBytes = new byte[0];
     private float[] rowFloats = new float[0];
 
     // 0 = unbekannt, 1 = normalisiert (0..1), 2 = Pixel
@@ -246,35 +246,34 @@ public class YoloDetector {
         int bufferLimit = buffer.limit();
         int planeSize = inputWidth * inputHeight;
 
-        // Nur den Bildbereich schreiben, der graue Rand bleibt unverändert.
-        // Jede Quellzeile wird auf einmal in ein Array kopiert (viel schneller als Pixel für Pixel).
-        if (rowBytes.length < rowStride) {
-            rowBytes = new byte[rowStride];
+        // Schritt 1: das ganze Bild auf einmal aus dem Grafikspeicher kopieren
+        if (frameBytes.length < bufferLimit) {
+            frameBytes = new byte[bufferLimit];
         }
+        buffer.position(0);
+        buffer.get(frameBytes, 0, bufferLimit);
+        long tCopy = System.nanoTime();
+
+        // Schritt 2: Pixel in Kommazahlen für die KI umrechnen (grauer Rand bleibt unverändert)
         if (rowFloats.length < scaledW * 3) {
             rowFloats = new float[scaledW * 3];
         }
-        int neededBytes = sxMap[scaledW - 1] * pixelStride + 4;
 
         for (int y = 0; y < scaledH; y++) {
             int rowStart = syMap[y] * rowStride;
             if (rowStart < 0 || rowStart >= bufferLimit) {
                 continue;
             }
-            int len = Math.min(Math.min(rowStride, neededBytes), bufferLimit - rowStart);
-            buffer.position(rowStart);
-            buffer.get(rowBytes, 0, len);
-
             int rowIndex = (padY + y) * inputWidth + padX;
 
             if (!isInputNchw) {
                 int o = 0;
                 for (int x = 0; x < scaledW; x++) {
-                    int off = sxMap[x] * pixelStride;
-                    if (off + 2 < len) {
-                        rowFloats[o] = (rowBytes[off] & 0xFF) * INV_255;
-                        rowFloats[o + 1] = (rowBytes[off + 1] & 0xFF) * INV_255;
-                        rowFloats[o + 2] = (rowBytes[off + 2] & 0xFF) * INV_255;
+                    int idx = rowStart + sxMap[x] * pixelStride;
+                    if (idx + 2 < bufferLimit) {
+                        rowFloats[o] = (frameBytes[idx] & 0xFF) * INV_255;
+                        rowFloats[o + 1] = (frameBytes[idx + 1] & 0xFF) * INV_255;
+                        rowFloats[o + 2] = (frameBytes[idx + 2] & 0xFF) * INV_255;
                     } else {
                         rowFloats[o] = PAD_VALUE;
                         rowFloats[o + 1] = PAD_VALUE;
@@ -286,14 +285,14 @@ public class YoloDetector {
                 floatBufferView.put(rowFloats, 0, scaledW * 3);
             } else {
                 for (int x = 0; x < scaledW; x++) {
-                    int off = sxMap[x] * pixelStride;
-                    if (off + 2 >= len) {
+                    int idx = rowStart + sxMap[x] * pixelStride;
+                    if (idx + 2 >= bufferLimit) {
                         continue;
                     }
                     int pixelIndex = rowIndex + x;
-                    floatBufferView.put(pixelIndex, (rowBytes[off] & 0xFF) * INV_255);
-                    floatBufferView.put(planeSize + pixelIndex, (rowBytes[off + 1] & 0xFF) * INV_255);
-                    floatBufferView.put(2 * planeSize + pixelIndex, (rowBytes[off + 2] & 0xFF) * INV_255);
+                    floatBufferView.put(pixelIndex, (frameBytes[idx] & 0xFF) * INV_255);
+                    floatBufferView.put(planeSize + pixelIndex, (frameBytes[idx + 1] & 0xFF) * INV_255);
+                    floatBufferView.put(2 * planeSize + pixelIndex, (frameBytes[idx + 2] & 0xFF) * INV_255);
                 }
             }
         }
@@ -412,9 +411,10 @@ public class YoloDetector {
         long tEnd = System.nanoTime();
         lastDebug = String.format(
                 Locale.US,
-                "%s Vor:%d Modell:%d Nach:%d ms | Enemy:%.2f",
+                "%s Kopie:%d Umr:%d Modell:%d Nach:%d ms | Enemy:%.2f",
                 usingGpu ? "GPU" : "CPU",
-                (tPre - tStart) / 1_000_000,
+                (tCopy - tStart) / 1_000_000,
+                (tPre - tCopy) / 1_000_000,
                 (tRun - tPre) / 1_000_000,
                 (tEnd - tRun) / 1_000_000,
                 enemyMax
@@ -450,4 +450,4 @@ public class YoloDetector {
     public synchronized void close() {
         closeInterpreter();
     }
-}
+    }
