@@ -143,3 +143,178 @@ public class ScreenCaptureService extends Service {
                         stopSelf();
                     }
                 }
+            };
+            mediaProjection.registerCallback(projectionCallback, handler);
+            setupCapture();
+        } else {
+            stopSelf();
+        }
+
+        return START_NOT_STICKY;
+    }
+
+    private void cleanupCapture() {
+        if (virtualDisplay != null) {
+            virtualDisplay.release();
+            virtualDisplay = null;
+        }
+        if (imageReader != null) {
+            imageReader.close();
+            imageReader = null;
+        }
+        if (mediaProjection != null) {
+            if (projectionCallback != null) {
+                mediaProjection.unregisterCallback(projectionCallback);
+                projectionCallback = null;
+            }
+            mediaProjection.stop();
+            mediaProjection = null;
+        }
+    }
+
+    private void setupCapture() {
+        updateScreenMetrics();
+
+        ImageReader oldReader = imageReader;
+        ImageReader newReader = ImageReader.newInstance(
+                captureWidth,
+                captureHeight,
+                PixelFormat.RGBA_8888,
+                2
+        );
+
+        newReader.setOnImageAvailableListener(reader -> {
+            if (isResizing) return;
+
+            DisplayMetrics currentMetrics = new DisplayMetrics();
+            windowManager.getDefaultDisplay().getRealMetrics(currentMetrics);
+            if (currentMetrics.widthPixels != screenWidth || currentMetrics.heightPixels != screenHeight) {
+                isResizing = true;
+                handler.post(() -> {
+                    setupCapture();
+                    isResizing = false;
+                });
+                return;
+            }
+
+            Image image = null;
+            try {
+                image = reader.acquireLatestImage();
+                if (image == null) return;
+
+                long now = System.currentTimeMillis();
+                if (now - lastProcessTime < MIN_FRAME_INTERVAL_MS) {
+                    return;
+                }
+                lastProcessTime = now;
+
+                Image.Plane[] planes = image.getPlanes();
+                ByteBuffer buffer = planes[0].getBuffer();
+                int pixelStride = planes[0].getPixelStride();
+                int rowStride = planes[0].getRowStride();
+
+                long t0 = System.nanoTime();
+                List<ColorDetector.Detection> detections = yoloDetector != null
+                        ? yoloDetector.detect(
+                                buffer,
+                                captureWidth,
+                                captureHeight,
+                                pixelStride,
+                                rowStride,
+                                screenWidth,
+                                screenHeight
+                        )
+                        : Collections.emptyList();
+
+                long ms = (System.nanoTime() - t0) / 1_000_000;
+                String debugInfo = yoloDetector != null ? yoloDetector.getLastDebug() : "Detector null";
+                overlayView.updateDetections(
+                        detections,
+                        "KI: " + ms + " ms | Treffer: " + detections.size() + " | " + debugInfo
+                );
+
+                if (AutoClickService.isRunning()) {
+                    for (ColorDetector.Detection d : detections) {
+                        if (d.type == ColorDetector.TargetType.ENEMY) {
+                            AutoClickService.click(d.box.centerX(), d.box.centerY());
+                            break;
+                        }
+                    }
+                }
+            } catch (Exception e) {
+                overlayView.updateDetections(Collections.emptyList(), "ERR: " + e.getMessage());
+            } finally {
+                if (image != null) {
+                    image.close();
+                }
+            }
+        }, handler);
+
+        imageReader = newReader;
+
+        if (virtualDisplay == null) {
+            virtualDisplay = mediaProjection.createVirtualDisplay(
+                    "TargetDetectorDisplay",
+                    captureWidth,
+                    captureHeight,
+                    captureDensity,
+                    DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                    imageReader.getSurface(),
+                    null,
+                    handler
+            );
+        } else {
+            virtualDisplay.resize(captureWidth, captureHeight, captureDensity);
+            virtualDisplay.setSurface(imageReader.getSurface());
+        }
+
+        if (oldReader != null) {
+            oldReader.close();
+        }
+    }
+
+    private Notification createNotification() {
+        return new Notification.Builder(this, CHANNEL_ID)
+                .setContentTitle("Target Detector läuft")
+                .setContentText("KI-Bildschirmanalyse ist aktiv")
+                .setSmallIcon(android.R.drawable.ic_menu_view)
+                .build();
+    }
+
+    private void createNotificationChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            NotificationChannel channel = new NotificationChannel(
+                    CHANNEL_ID,
+                    "Target Detector",
+                    NotificationManager.IMPORTANCE_LOW
+            );
+            NotificationManager manager = getSystemService(NotificationManager.class);
+            if (manager != null) {
+                manager.createNotificationChannel(channel);
+            }
+        }
+    }
+
+    @Override
+    public void onDestroy() {
+        cleanupCapture();
+        if (yoloDetector != null) {
+            yoloDetector.close();
+            yoloDetector = null;
+        }
+        if (overlayView != null && windowManager != null) {
+            windowManager.removeView(overlayView);
+            overlayView = null;
+        }
+        if (handlerThread != null) {
+            handlerThread.quitSafely();
+            handlerThread = null;
+        }
+        super.onDestroy();
+    }
+
+    @Override
+    public IBinder onBind(Intent intent) {
+        return null;
+    }
+        }
