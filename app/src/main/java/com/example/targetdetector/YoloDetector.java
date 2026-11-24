@@ -655,7 +655,7 @@ public class YoloDetector {
     }
 
     // Ein Ring ist innen größtenteils nicht farbig (dort steht die Figur). Ein Busch oder Block ist innen voll.
-    private boolean isHollow(int minX, int minY, int maxX, int maxY, int width) {
+    private boolean isHollow(int minX, int minY, int maxX, int maxY, int width, byte[] mask) {
         int w = maxX - minX + 1;
         int h = maxY - minY + 1;
         int ix0 = minX + (int) (w * 0.3f);
@@ -667,7 +667,7 @@ public class YoloDetector {
         for (int y = iy0; y <= iy1; y++) {
             for (int x = ix0; x <= ix1; x++) {
                 total++;
-                if (ringMask[y * width + x] != 0) {
+                if (mask[y * width + x] != 0) {
                     filled++;
                 }
             }
@@ -735,7 +735,8 @@ public class YoloDetector {
         float maxW = width * RING_MAX_W;
         float minH = height * RING_MIN_H;
 
-        // Schritt 2: zusammenhängende Flecken finden und nur ringförmige behalten
+        // Schritt 2: zusammenhängende Flecken finden
+        List<int[]> comps = new ArrayList<>();
         for (int y = y0; y < y1; y++) {
             for (int x = x0; x < x1; x++) {
                 int start = y * width + x;
@@ -776,44 +777,52 @@ public class YoloDetector {
                     }
                 }
 
-                float w = maxX - minX + 1;
-                float h = maxY - minY + 1;
-                float aspect = w / h;
-                // Mein Ring ist nie ganz am Bildrand (rechts stehen grüne Würfel/Deko). Ausnahme: Busch-Suche nahe meiner letzten Position
-                if (!red && !weak) {
-                    float cxRel = (minX + maxX) * 0.5f / width;
-                    if (cxRel < GREEN_CENTER_X_MIN || cxRel > GREEN_CENTER_X_MAX) {
-                        continue;
-                    }
+                if (count >= 3) {
+                    comps.add(new int[]{minX, minY, maxX, maxY, count});
                 }
-                if (weak) {
-                    // Im Busch ist oft nur der untere Bogen des Rings sichtbar: flacher erlaubt, nicht hohl nötig
-                    if (count < RING_MIN_PIXELS || w < minW || w > width * 0.08f || h < height * 0.025f
-                            || aspect < RING_MIN_ASPECT || aspect > 6f) {
-                        continue;
-                    }
-                    rings.add(new Ring(new RectF(minX, minY, maxX + 1, maxY + 1), count));
+            }
+        }
+
+        // Schritt 4: nur ringförmige Flecken behalten
+        for (int[] c : comps) {
+            int minX = c[0], minY = c[1], maxX = c[2], maxY = c[3], count = c[4];
+            float w = maxX - minX + 1;
+            float h = maxY - minY + 1;
+            float aspect = w / h;
+            // Mein Ring ist nie ganz am Bildrand (rechts stehen grüne Würfel/Deko). Ausnahme: Busch-Suche nahe meiner letzten Position
+            if (!red && !weak) {
+                float cxRel = (minX + maxX) * 0.5f / width;
+                if (cxRel < GREEN_CENTER_X_MIN || cxRel > GREEN_CENTER_X_MAX) {
                     continue;
                 }
-                if (count < RING_MIN_PIXELS || w < minW || w > maxW || h < minH
-                        || aspect < RING_MIN_ASPECT || aspect > RING_MAX_ASPECT) {
-                    continue;
-                }
-                // Gegner-Ringe sind genauso groß wie meiner und leicht oval. Rote Deko hat andere Formen.
-                if (red) {
-                    float cxRel = (minX + maxX) * 0.5f / width;
-                    if (w < width * RED_MIN_W || w > width * RED_MAX_W || h < height * RED_MIN_H
-                            || aspect < RED_MIN_ASPECT || aspect > RED_MAX_ASPECT
-                            || cxRel < RED_CENTER_X_MIN || cxRel > RED_CENTER_X_MAX) {
-                        continue;
-                    }
-                }
-                // Ring muss innen hohl sein, sonst ist es ein Busch, Block o. Ä.
-                if (!isHollow(minX, minY, maxX, maxY, width)) {
+            }
+            if (weak) {
+                // Im Busch ist oft nur der untere Bogen des Rings sichtbar: flacher erlaubt, nicht hohl nötig
+                if (count < RING_MIN_PIXELS || w < minW || w > width * 0.08f || h < height * 0.025f
+                        || aspect < RING_MIN_ASPECT || aspect > 6f) {
                     continue;
                 }
                 rings.add(new Ring(new RectF(minX, minY, maxX + 1, maxY + 1), count));
+                continue;
             }
+            if (count < RING_MIN_PIXELS || w < minW || w > maxW || h < minH
+                    || aspect < RING_MIN_ASPECT || aspect > RING_MAX_ASPECT) {
+                continue;
+            }
+            // Gegner-Ringe sind genauso groß wie meiner und leicht oval. Rote Deko hat andere Formen.
+            if (red) {
+                float cxRel = (minX + maxX) * 0.5f / width;
+                if (w < width * RED_MIN_W || w > width * RED_MAX_W || h < height * RED_MIN_H
+                        || aspect < RED_MIN_ASPECT || aspect > RED_MAX_ASPECT
+                        || cxRel < RED_CENTER_X_MIN || cxRel > RED_CENTER_X_MAX) {
+                    continue;
+                }
+            }
+            // Ring muss innen hohl sein, sonst ist es ein Busch, Block o. Ä.
+            if (!isHollow(minX, minY, maxX, maxY, width, ringMask)) {
+                continue;
+            }
+            rings.add(new Ring(new RectF(minX, minY, maxX + 1, maxY + 1), count));
         }
         return rings;
     }
@@ -832,8 +841,9 @@ public class YoloDetector {
         boolean bestIsNear = best != null
                 && Math.hypot(best.centerX() - lastRingCx, best.centerY() - lastRingCy) < lastGoodRingW * 1.5f;
         boolean weakUsed = false;
+        int normalPixels = lastRingPixels;
         if (recent && !bestIsNear) {
-            float r = lastGoodRingW * 2.5f;
+            float r = lastGoodRingW * 1.6f;
             weakWindow = new RectF(lastRingCx - r, lastRingCy - r, lastRingCx + r, lastRingCy + r);
             RectF weakBest = pickMeRing(findRings(false, width, height, pixelStride, rowStride, limit),
                     true, true, width, height);
@@ -844,19 +854,21 @@ public class YoloDetector {
                 float cx = weakBest.centerX();
                 best = new RectF(cx - w * 0.5f, weakBest.bottom - w * 0.75f, cx + w * 0.5f, weakBest.bottom);
                 weakUsed = true;
-            } else if (best != null) {
-                // Weit weg von mir und nichts in meiner Nähe: nur glauben, wenn ich schon länger verschwunden bin
-                best = null;
+            } else {
+                // Nichts Blasses in meiner Nähe: dann gilt der normal gefundene Ring (falls es einen gibt)
+                lastRingPixels = normalPixels;
             }
         }
 
         if (best != null) {
             if (!weakUsed) {
                 lastGoodRingW = lastGoodRingW <= 0f ? best.width() : lastGoodRingW * 0.8f + best.width() * 0.2f;
+                // Nur ein ECHTER Ring-Treffer verlängert die Busch-Suche. Sonst könnte sich die Busch-Suche
+                // an etwas Falschem (z. B. den eigenen grünen Overlay-Ecken) endlos festhalten.
+                lastRingTime = nowMs;
             }
             lastRingCx = best.centerX();
             lastRingCy = best.centerY();
-            lastRingTime = nowMs;
         }
         return best;
     }
@@ -877,7 +889,9 @@ public class YoloDetector {
                 continue;
             }
             // Im Busch-Modus muss der Ring auf meiner Höhe liegen (mein grüner Lebensbalken ist weiter oben)
-            if (weakMode && Math.abs(ring.box.centerY() - lastRingCy) > lastGoodRingW * 0.6f) {
+            // und darf sich nur wenig bewegt haben (sonst ist es ein anderer grüner Fleck, z. B. Spielfeld)
+            if (weakMode && (Math.abs(ring.box.centerY() - lastRingCy) > lastGoodRingW * 0.6f
+                    || Math.abs(ring.box.centerX() - lastRingCx) > lastGoodRingW * 0.8f)) {
                 continue;
             }
             float cx = ring.box.centerX();
