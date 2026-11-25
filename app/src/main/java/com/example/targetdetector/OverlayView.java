@@ -45,6 +45,8 @@ public class OverlayView extends View {
     private static final float VEL_SMOOTH = 0.3f;
     private static final float MIN_SPEED = 0.07f;      // px pro ms
     private static final float MAX_LEAD_RATIO = 0.6f;
+    // Nach einem Dash (z. B. Mortis) sofort abbremsen, sonst schießt die Box über (px pro ms)
+    private static final float DASH_SPEED = 0.35f;
 
     // Ziellinie: dünn und leicht durchsichtig, damit die KI sie kaum sieht
     private static final float AIM_LINE_WIDTH = 3f;
@@ -163,8 +165,12 @@ public class OverlayView extends View {
         float dt = now - meRawTime;
         if (meRaw != null && dt > 0f && dt < 200f
                 && Math.hypot(fresh.centerX() - meRaw.centerX(), fresh.centerY() - meRaw.centerY()) <= fresh.width()) {
-            meVx = VEL_SMOOTH * (fresh.centerX() - meRaw.centerX()) / dt + (1f - VEL_SMOOTH) * meVx;
-            meVy = VEL_SMOOTH * (fresh.centerY() - meRaw.centerY()) / dt + (1f - VEL_SMOOTH) * meVy;
+            float ix = (fresh.centerX() - meRaw.centerX()) / dt;
+            float iy = (fresh.centerY() - meRaw.centerY()) / dt;
+            float vs = (float) Math.hypot(meVx, meVy);
+            float a = vs >= DASH_SPEED && Math.hypot(ix, iy) < 0.5f * vs ? 0.8f : VEL_SMOOTH;
+            meVx = a * ix + (1f - a) * meVx;
+            meVy = a * iy + (1f - a) * meVy;
         } else {
             meVx = 0f;
             meVy = 0f;
