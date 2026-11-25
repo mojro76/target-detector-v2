@@ -322,10 +322,19 @@ public class OverlayView extends View {
         float rx = fresh.centerX() - px;
         float ry = fresh.centerY() - py;
         if (dt > 0f && dt < 200f && Math.hypot(rx, ry) <= fresh.width()) {
+            float ix = (fresh.centerX() - m[0]) / dt;
+            float iy = (fresh.centerY() - m[1]) / dt;
+            float vs = (float) Math.hypot(m[2], m[3]);
+            if (vs >= DASH_SPEED && Math.hypot(ix, iy) < 0.5f * vs) {
+                // Nach einem Dash (z. B. Mortis) sofort abbremsen, gleiche Regel wie bei der Ich-Box
+                m[2] = 0.8f * ix + 0.2f * m[2];
+                m[3] = 0.8f * iy + 0.2f * m[3];
+            } else {
+                m[2] += ENEMY_VEL_FOLLOW * rx / dt;
+                m[3] += ENEMY_VEL_FOLLOW * ry / dt;
+            }
             m[0] = px + ENEMY_POS_FOLLOW * rx;
             m[1] = py + ENEMY_POS_FOLLOW * ry;
-            m[2] += ENEMY_VEL_FOLLOW * rx / dt;
-            m[3] += ENEMY_VEL_FOLLOW * ry / dt;
         } else {
             m[0] = fresh.centerX();
             m[1] = fresh.centerY();
