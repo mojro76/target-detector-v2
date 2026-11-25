@@ -110,6 +110,10 @@ public class YoloDetector {
     private static final float RING_SCORE_BOOT = 0.55f;    // Mindestwert beim ersten Lernen der Größe
     private static final long RING_LOCAL_MS = 1500;       // so lange wird zuerst nahe der letzten Position gesucht
     private static final long RING_RESET_MS = 5000;       // so lange nichts gefunden -> Größe neu lernen (neue Karte)
+    // Nur Treffer ab diesem Wert halten die gelernte Größe. KI-Einsprung und schwache Treffer zählen nicht
+    // (Messung: mit falscher Größe gab es nur Zufallstreffer um 30-35 % und die Größe blieb hängen).
+    // Die Ringgröße war auf allen Karten gleich (34-36), Neulernen ist also nur bei Fehlern nötig.
+    private static final float RING_SCORE_KEEP = 0.40f;
     private static final int BOOT_SAMPLES = 3;             // so viele gute Messungen braucht das erste Lernen
     private static final int GLOBAL_CHECK_EVERY = 4;       // jedes 4. Bild zusätzlich im ganzen Bild nachsehen
 
@@ -1221,8 +1225,12 @@ public class YoloDetector {
     private RectF findMeRing(int width, int height, int pixelStride, int rowStride, int limit, long nowMs,
                              RectF aiMeImg) {
         frameCounter++;
-        // Lange nichts gefunden (neue Runde, andere Karte): Größe neu lernen
-        if (ringW > 0f && nowMs - lastMatchTime > RING_RESET_MS) {
+        // Lange kein guter Treffer, obwohl die KI mich sieht (falsch gelernt, andere Kamera): neu lernen.
+        // Zeit, in der die KI mich nicht sieht (tot, Ladebildschirm, Busch), zählt nicht.
+        if (ringW > 0f && aiMeImg == null) {
+            lastRingTime = nowMs;
+        }
+        if (ringW > 0f && nowMs - lastRingTime > RING_RESET_MS) {
             ringW = 0f;
             bootW = 0f;
             sizeLocked = false;
@@ -1283,7 +1291,9 @@ public class YoloDetector {
         lastRingCx = best[0];
         lastRingCy = best[1];
         lastMatchTime = nowMs;
-        lastRingTime = nowMs;
+        if (best[2] >= RING_SCORE_KEEP) {
+            lastRingTime = nowMs;
+        }
         float w = ringW * RING_BOX_SCALE;
         float h = w / RING_ASPECT;
         return new RectF(best[0] - w * 0.5f, best[1] - h * 0.5f, best[0] + w * 0.5f, best[1] + h * 0.5f);
