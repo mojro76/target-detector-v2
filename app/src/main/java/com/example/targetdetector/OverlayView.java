@@ -47,6 +47,10 @@ public class OverlayView extends View {
     private static final float MAX_LEAD_RATIO = 0.6f;
     // Nach einem Dash (z. B. Mortis) sofort abbremsen, sonst schießt die Box über (px pro ms)
     private static final float DASH_SPEED = 0.35f;
+    // Gegner-Boxen ebenfalls LEAD_MS vorausschieben. Position und Tempo werden zusammen geglättet
+    // (Alpha-Beta-Filter): an den Aufnahmen 30 % näher an der echten Position und ruhiger als vorher.
+    private static final float ENEMY_POS_FOLLOW = 0.5f;
+    private static final float ENEMY_VEL_FOLLOW = 0.15f;
 
     // Ziellinie: dünn und leicht durchsichtig, damit die KI sie kaum sieht
     private static final float AIM_LINE_WIDTH = 3f;
@@ -70,6 +74,8 @@ public class OverlayView extends View {
     // damit kurz aufblitzende Fehl-Boxen nicht 350 ms stehen bleiben.
     private List<Integer> hitCounts = new ArrayList<>();
     private static final int MIN_HITS_FOR_HOLD = 3;
+    // Geglättete Mitte und Tempo jeder Box {x, y, vx, vy} (gleiche Reihenfolge wie detections)
+    private List<float[]> motions = new ArrayList<>();
 
     // Meine letzte bekannte Position
     private RectF meBox = null;
@@ -308,6 +314,37 @@ public class OverlayView extends View {
         };
     }
 
+    // Glättet Mitte und Tempo m = {x, y, vx, vy} (dt in ms) und liefert die um LEAD_MS
+    // vorausgeschobene Box. Großer Sprung oder lange Pause = neu anfangen, Tempo 0.
+    private static RectF predictEnemy(RectF fresh, float[] m, float dt) {
+        float px = m[0] + m[2] * dt;
+        float py = m[1] + m[3] * dt;
+        float rx = fresh.centerX() - px;
+        float ry = fresh.centerY() - py;
+        if (dt > 0f && dt < 200f && Math.hypot(rx, ry) <= fresh.width()) {
+            m[0] = px + ENEMY_POS_FOLLOW * rx;
+            m[1] = py + ENEMY_POS_FOLLOW * ry;
+            m[2] += ENEMY_VEL_FOLLOW * rx / dt;
+            m[3] += ENEMY_VEL_FOLLOW * ry / dt;
+        } else {
+            m[0] = fresh.centerX();
+            m[1] = fresh.centerY();
+            m[2] = 0f;
+            m[3] = 0f;
+        }
+        float ox = m[2] * LEAD_MS;
+        float oy = m[3] * LEAD_MS;
+        float len = (float) Math.hypot(ox, oy);
+        float lim = MAX_LEAD_RATIO * fresh.width();
+        if (len > lim) {
+            ox *= lim / len;
+            oy *= lim / len;
+        }
+        float w = fresh.width() / 2f;
+        float h = fresh.height() / 2f;
+        return new RectF(m[0] + ox - w, m[1] + oy - h, m[0] + ox + w, m[1] + oy + h);
+    }
+
     // Vergleicht jede neue Box mit der passenden Box vom letzten Mal.
     // Kleine Änderungen bei Größe und Position werden ignoriert, große sofort übernommen.
     // Alte Boxen ohne neuen Treffer bleiben bis zu HOLD_MS stehen (gegen kurzes Verschwinden).
@@ -319,22 +356,20 @@ public class OverlayView extends View {
         List<ColorDetector.Detection> result = new ArrayList<>();
         List<Long> resultSeen = new ArrayList<>();
         List<Integer> resultHits = new ArrayList<>();
+        List<float[]> resultMotions = new ArrayList<>();
         boolean[] used = new boolean[previous.size()];
 
         for (ColorDetector.Detection d : fresh) {
-            float dcx = d.box.centerX();
-            float dcy = d.box.centerY();
-            float dw = d.box.width();
-            float dh = d.box.height();
-
+            // Zuordnung über die geglättete (nicht vorausgeschobene) letzte Mitte
             int best = -1;
             float bestDist = Float.MAX_VALUE;
-            for (int i = 0; i < previous.size(); i++) {
+            for (int i = 0; i < previous.size() && i < motions.size(); i++) {
                 ColorDetector.Detection p = previous.get(i);
                 if (used[i] || !sameKind(p.type, d.type)) {
                     continue;
                 }
-                float dist = (float) Math.hypot(dcx - p.box.centerX(), dcy - p.box.centerY());
+                float[] m = motions.get(i);
+                float dist = (float) Math.hypot(d.box.centerX() - m[0], d.box.centerY() - m[1]);
                 float gate = Math.max(p.box.width(), p.box.height()) * 0.6f;
                 if (dist < gate && dist < bestDist) {
                     best = i;
@@ -346,14 +381,19 @@ public class OverlayView extends View {
                 result.add(d);
                 resultSeen.add(now);
                 resultHits.add(1);
+                resultMotions.add(new float[]{d.box.centerX(), d.box.centerY(), 0f, 0f});
                 continue;
             }
             used[best] = true;
             RectF p = previous.get(best).box;
+            float[] m = motions.get(best);
+            RectF moved = predictEnemy(d.box, m, now - seenTimes.get(best));
+            float dw = moved.width();
+            float dh = moved.height();
 
-            float cx = dcx;
-            float cy = dcy;
-            if (bestDist < CENTER_DEADZONE_PX) {
+            float cx = moved.centerX();
+            float cy = moved.centerY();
+            if (Math.hypot(cx - p.centerX(), cy - p.centerY()) < CENTER_DEADZONE_PX) {
                 cx = p.centerX();
                 cy = p.centerY();
             }
@@ -371,6 +411,7 @@ public class OverlayView extends View {
             result.add(new ColorDetector.Detection(box, d.type));
             resultSeen.add(now);
             resultHits.add((best < hitCounts.size() ? hitCounts.get(best) : 0) + 1);
+            resultMotions.add(m);
         }
 
         // Nicht wiedergefundene Boxen noch kurz behalten, wenn sie nicht auf einer neuen Box liegen
@@ -404,11 +445,13 @@ public class OverlayView extends View {
                 result.add(p);
                 resultSeen.add(seen);
                 resultHits.add(hits);
+                resultMotions.add(motions.get(i));
             }
         }
 
         seenTimes = resultSeen;
         hitCounts = resultHits;
+        motions = resultMotions;
         return result;
     }
 
