@@ -13,6 +13,21 @@ import java.util.List;
 
 public class OverlayView extends View {
 
+    // Unveränderlicher Schnappschuss der aktuellen Ziellinie für den Hintergrund-Thread
+    public static final class AimSnapshot {
+        public final float dirX;
+        public final float dirY;
+        public final float distancePx;
+        public final long timestampMs;
+
+        public AimSnapshot(float dirX, float dirY, float distancePx, long timestampMs) {
+            this.dirX = dirX;
+            this.dirY = dirY;
+            this.distancePx = distancePx;
+            this.timestampMs = timestampMs;
+        }
+    }
+
     // Farben so gewählt, dass die Ring-Suche im YoloDetector die eigenen Ecken NICHT als Ring sieht
     // (auch nicht an den Kanten, wo sich die Farbe mit Busch/Boden mischt). Auf Screenshots getestet.
     private static final int COLOR_PLAYER = Color.rgb(0, 200, 255);    // türkis-blau = ich
@@ -91,6 +106,7 @@ public class OverlayView extends View {
     private float lineStartX, lineStartY, lineEndX, lineEndY;
     private float targetCx, targetCy;
     private boolean hasTarget = false;
+    private volatile AimSnapshot latestAim = null;
 
     public OverlayView(Context context) {
         super(context);
@@ -108,6 +124,18 @@ public class OverlayView extends View {
         textPaint.setColor(Color.YELLOW);
         textPaint.setTextSize(30f);
         textPaint.setShadowLayer(3f, 1f, 1f, Color.BLACK);
+    }
+
+    // Liefert die aktuelle Ziellinie, sofern sie nicht älter als maxAgeMs ist
+    public AimSnapshot getAimSnapshot(long maxAgeMs) {
+        AimSnapshot snap = latestAim;
+        if (snap == null) {
+            return null;
+        }
+        if (SystemClock.uptimeMillis() - snap.timestampMs > maxAgeMs) {
+            return null;
+        }
+        return snap;
     }
 
     public void updateDetections(List<ColorDetector.Detection> newDetections, String status) {
@@ -224,6 +252,7 @@ public class OverlayView extends View {
         if (!meValid(now)) {
             hasLine = false;
             hasTarget = false;
+            latestAim = null;
             return;
         }
 
@@ -260,6 +289,7 @@ public class OverlayView extends View {
         if (nearest == null) {
             hasLine = false;
             hasTarget = false;
+            latestAim = null;
             return;
         }
 
@@ -282,22 +312,26 @@ public class OverlayView extends View {
             lineEndX = ex;
             lineEndY = ey;
             hasLine = true;
-            return;
-        }
-
-        float[] s = smooth(lineStartX, lineStartY, sx, sy);
-        lineStartX = s[0];
-        lineStartY = s[1];
-
-        if (targetChanged) {
-            // Neues Ziel: Linienende springt sofort, statt langsam rüberzugleiten
-            lineEndX = ex;
-            lineEndY = ey;
         } else {
-            float[] e = smooth(lineEndX, lineEndY, ex, ey);
-            lineEndX = e[0];
-            lineEndY = e[1];
+            float[] s = smooth(lineStartX, lineStartY, sx, sy);
+            lineStartX = s[0];
+            lineStartY = s[1];
+
+            if (targetChanged) {
+                // Neues Ziel: Linienende springt sofort, statt langsam rüberzugleiten
+                lineEndX = ex;
+                lineEndY = ey;
+            } else {
+                float[] e = smooth(lineEndX, lineEndY, ex, ey);
+                lineEndX = e[0];
+                lineEndY = e[1];
+            }
         }
+
+        float dx = lineEndX - lineStartX;
+        float dy = lineEndY - lineStartY;
+        float dist = (float) Math.hypot(dx, dy);
+        latestAim = new AimSnapshot(dx, dy, dist, now);
     }
 
     private static float[] smooth(float oldX, float oldY, float newX, float newY) {
