@@ -21,6 +21,7 @@ import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.IBinder;
 import android.os.Looper;
+import android.os.SystemClock;
 import android.text.SpannableString;
 import android.text.Spanned;
 import android.text.style.ForegroundColorSpan;
@@ -30,10 +31,12 @@ import android.view.Gravity;
 import android.view.MotionEvent;
 import android.view.WindowManager;
 import android.widget.TextView;
+import android.widget.Toast;
 
 import java.nio.ByteBuffer;
 import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.ThreadLocalRandom;
 
 public class ScreenCaptureService extends Service {
 
@@ -42,6 +45,15 @@ public class ScreenCaptureService extends Service {
     // Wird das Handy zu heiß, Wert erhöhen (z. B. 30 oder 40).
     private static final long MIN_FRAME_INTERVAL_MS = 15;
     private static final float CAPTURE_LONG_SIDE = 640f; // lange Bildseite passend zur KI
+
+    // ===== Schuss-Konfiguration (gemessen auf 2340x1080: Angriff = 1952, 640 | Zielkreis ~155 px) =====
+    private static final float ATTACK_JOYSTICK_X_RATIO = 1952f / 2340f; // 0.8342
+    private static final float ATTACK_JOYSTICK_Y_RATIO = 640f / 1080f;  // 0.5926
+    private static final float ATTACK_SWIPE_RADIUS_RATIO = 148f / 1080f; // ~0.137 * Bildschirmhöhe
+    private static final float MAX_SHOOT_RANGE_RATIO = 0.45f;           // max. 45 % der Bildschirmbreite
+    private static final long SHOOT_COOLDOWN_MIN_MS = 450L;             // minimale Pause zwischen Schüssen
+    private static final long SHOOT_COOLDOWN_MAX_MS = 600L;             // maximale Pause zwischen Schüssen
+    private static final long AIM_MAX_AGE_MS = 250L;                    // ältere Ziellinien nicht mehr nutzen
 
     private MediaProjection mediaProjection;
     private MediaProjection.Callback projectionCallback;
@@ -70,6 +82,12 @@ public class ScreenCaptureService extends Service {
         }
     };
 
+    // ===== Schuss-Schalter (gleicher Stil wie REC) =====
+    private TextView shootButton;
+    private WindowManager.LayoutParams shootParams;
+    private volatile boolean shootEnabled = false;
+    private long nextShotAllowedMs = 0L;
+
     private int screenWidth;
     private int screenHeight;
     private int captureWidth;
@@ -95,6 +113,7 @@ public class ScreenCaptureService extends Service {
         if (prefs.getBoolean(FrameRecorder.KEY_BUTTON, true)) {
             setupRecordButton();
         }
+        setupShootButton();
     }
 
     private void updateScreenMetrics() {
@@ -227,6 +246,158 @@ public class ScreenCaptureService extends Service {
         if (bg != null) {
             bg.setColor(rec ? Color.argb(200, 150, 20, 20) : Color.argb(170, 30, 30, 30));
         }
+    }
+
+    // Zweiter Schwebe-Knopf direkt unter REC: antippen = SCHUSS an/aus, ziehen = verschieben.
+    // Dunkel bzw. gedämpftes Bernsteingelb, damit die Ring-Erkennung ihn ignoriert.
+    private void setupShootButton() {
+        shootButton = new TextView(this);
+        shootButton.setTextColor(Color.WHITE);
+        shootButton.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        int pad = dp(8);
+        shootButton.setPadding(dp(10), pad, dp(10), pad);
+        GradientDrawable bg = new GradientDrawable();
+        bg.setColor(Color.argb(170, 30, 30, 30));
+        bg.setCornerRadius(dp(16));
+        shootButton.setBackground(bg);
+        updateShootButton();
+
+        int overlayType = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
+                ? WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+                : WindowManager.LayoutParams.TYPE_PHONE;
+        shootParams = new WindowManager.LayoutParams(
+                WindowManager.LayoutParams.WRAP_CONTENT,
+                WindowManager.LayoutParams.WRAP_CONTENT,
+                overlayType,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                        | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+                        | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                PixelFormat.TRANSLUCENT
+        );
+        shootParams.gravity = Gravity.TOP | Gravity.LEFT;
+        shootParams.x = dp(4);
+        shootParams.y = recParams != null
+                ? recParams.y + dp(46)
+                : Math.round(Math.min(screenWidth, screenHeight) * 0.42f);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            shootParams.layoutInDisplayCutoutMode =
+                    WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
+        }
+
+        final int touchSlop = dp(8);
+        shootButton.setOnTouchListener(new android.view.View.OnTouchListener() {
+            private float downX;
+            private float downY;
+            private int startX;
+            private int startY;
+            private boolean dragging;
+
+            @Override
+            public boolean onTouch(android.view.View v, MotionEvent e) {
+                switch (e.getActionMasked()) {
+                    case MotionEvent.ACTION_DOWN:
+                        downX = e.getRawX();
+                        downY = e.getRawY();
+                        startX = shootParams.x;
+                        startY = shootParams.y;
+                        dragging = false;
+                        return true;
+                    case MotionEvent.ACTION_MOVE:
+                        float dx = e.getRawX() - downX;
+                        float dy = e.getRawY() - downY;
+                        if (!dragging && Math.hypot(dx, dy) > touchSlop) {
+                            dragging = true;
+                        }
+                        if (dragging && shootButton != null) {
+                            shootParams.x = startX + Math.round(dx);
+                            shootParams.y = startY + Math.round(dy);
+                            windowManager.updateViewLayout(shootButton, shootParams);
+                        }
+                        return true;
+                    case MotionEvent.ACTION_UP:
+                        if (!dragging) {
+                            toggleShoot();
+                        }
+                        return true;
+                    default:
+                        return false;
+                }
+            }
+        });
+
+        windowManager.addView(shootButton, shootParams);
+    }
+
+    private void toggleShoot() {
+        if (!shootEnabled) {
+            if (!AutoClickService.isRunning()) {
+                Toast.makeText(this, "Bedienungshilfe (AutoClickService) erst aktivieren", Toast.LENGTH_SHORT).show();
+                updateShootButton();
+                return;
+            }
+            shootEnabled = true;
+        } else {
+            shootEnabled = false;
+        }
+        updateShootButton();
+    }
+
+    // Text des Knopfs: "○ SCHUSS" (aus), "● SCHUSS" (an)
+    private void updateShootButton() {
+        if (shootButton == null) {
+            return;
+        }
+        boolean on = shootEnabled;
+        String text = (on ? "\u25CF" : "\u25CB") + " SCHUSS";
+        SpannableString span = new SpannableString(text);
+        span.setSpan(new ForegroundColorSpan(on ? Color.rgb(255, 210, 60) : Color.rgb(170, 170, 170)),
+                0, 1, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+        shootButton.setText(span);
+        GradientDrawable bg = (GradientDrawable) shootButton.getBackground();
+        if (bg != null) {
+            bg.setColor(on ? Color.argb(205, 155, 95, 15) : Color.argb(170, 30, 30, 30));
+        }
+    }
+
+    // Löst bei aktivem SCHUSS-Schalter einen ergonomischen Joystick-Wisch entlang der Ziellinie aus
+    private void tryAutoShoot() {
+        if (!shootEnabled || overlayView == null) {
+            return;
+        }
+        if (!AutoClickService.isRunning()) {
+            shootEnabled = false;
+            mainHandler.post(this::updateShootButton);
+            return;
+        }
+        // Nur im Querformat (Spiel) auslösen, nicht im Hochformat-Menü
+        if (screenWidth <= screenHeight) {
+            return;
+        }
+
+        long nowUptime = SystemClock.uptimeMillis();
+        if (nowUptime < nextShotAllowedMs || !AutoClickService.canStartGesture()) {
+            return;
+        }
+
+        OverlayView.AimSnapshot aim = overlayView.getAimSnapshot(AIM_MAX_AGE_MS);
+        if (aim == null || aim.distancePx < 10f) {
+            return;
+        }
+
+        float maxRangePx = screenWidth * MAX_SHOOT_RANGE_RATIO;
+        if (aim.distancePx > maxRangePx) {
+            return;
+        }
+
+        float joyX = screenWidth * ATTACK_JOYSTICK_X_RATIO;
+        float joyY = screenHeight * ATTACK_JOYSTICK_Y_RATIO;
+        float swipeRadius = screenHeight * ATTACK_SWIPE_RADIUS_RATIO;
+
+        AutoClickService.aimSwipe(joyX, joyY, aim.dirX, aim.dirY, swipeRadius);
+
+        long cooldown = ThreadLocalRandom.current()
+                .nextLong(SHOOT_COOLDOWN_MIN_MS, SHOOT_COOLDOWN_MAX_MS + 1L);
+        nextShotAllowedMs = nowUptime + cooldown;
     }
 
     private int dp(float v) {
@@ -374,14 +545,7 @@ public class ScreenCaptureService extends Service {
                         "KI: " + ms + " ms | Treffer: " + detections.size() + " | " + debugInfo
                 );
 
-                if (AutoClickService.isRunning()) {
-                    for (ColorDetector.Detection d : detections) {
-                        if (d.type == ColorDetector.TargetType.ENEMY) {
-                            AutoClickService.click(d.box.centerX(), d.box.centerY());
-                            break;
-                        }
-                    }
-                }
+                tryAutoShoot();
             } catch (Exception e) {
                 overlayView.updateDetections(Collections.emptyList(), "ERR: " + e.getMessage());
             } finally {
@@ -446,6 +610,11 @@ public class ScreenCaptureService extends Service {
         if (recButton != null && windowManager != null) {
             windowManager.removeView(recButton);
             recButton = null;
+        }
+        shootEnabled = false;
+        if (shootButton != null && windowManager != null) {
+            windowManager.removeView(shootButton);
+            shootButton = null;
         }
         cleanupCapture();
         if (yoloDetector != null) {
